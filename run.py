@@ -11,6 +11,44 @@ from utils.print_args import print_args
 import random
 import numpy as np
 
+'''
+运行参数
+--task_name
+classification
+--is_training
+1
+--root_path
+./dataset/EthanolConcentration/
+--model_id
+EthanolConcentration
+--model
+TimesNet
+--data
+UEA
+--e_layers
+2
+--batch_size
+16
+--d_model
+16
+--d_ff
+32
+--top_k
+3
+--des
+'Exp'
+--itr
+1
+--learning_rate
+0.001
+--train_epochs
+30
+--patience
+10
+--num_workers
+0
+'''
+
 if __name__ == '__main__':
     fix_seed = 2021
     random.seed(fix_seed)
