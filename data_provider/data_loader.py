@@ -615,112 +615,145 @@ class SWATSegLoader(Dataset):
 
 class UEAloader(Dataset):
     """
-    Dataset class for datasets included in:
-        Time Series Classification Archive (www.timeseriesclassification.com)
-    Argument:
-        limit_size: float in (0, 1) for debug
-    Attributes:
-        all_df: (num_samples * seq_len, num_columns) dataframe indexed by integer indices, with multiple rows corresponding to the same index (sample).
-            Each row is a time step; Each column contains either metadata (e.g. timestamp) or a feature.
-        feature_df: (num_samples * seq_len, feat_dim) dataframe; contains the subset of columns of `all_df` which correspond to selected features
-        feature_names: names of columns contained in `feature_df` (same as feature_df.columns)
-        all_IDs: (num_samples,) series of IDs contained in `all_df`/`feature_df` (same as all_df.index.unique() )
-        labels_df: (num_samples, num_labels) pd.DataFrame of label(s) for each sample
-        max_seq_len: maximum sequence (time series) length. If None, script argument `max_seq_len` will be used.
-            (Moreover, script argument overrides this attribute)
+    用于处理以下数据集的Dataset类：
+        时间序列分类档案库 (www.timeseriesclassification.com)
+    参数：
+        limit_size: float类型，范围(0, 1)，用于调试时限制数据集大小
+    属性：
+        all_df: (num_samples * seq_len, num_columns) 数据框，按整数索引索引，多个行对应同一个索引（样本）。
+            每一行是一个时间步；每一列包含元数据（例如时间戳）或特征。
+        feature_df: (num_samples * seq_len, feat_dim) 数据框；包含`all_df`中对应选定特征的列子集
+        feature_names: `feature_df`中包含的列名（与feature_df.columns相同）
+        all_IDs: (num_samples,) 包含在`all_df`/`feature_df`中的ID序列（与all_df.index.unique()相同）
+        labels_df: (num_samples, num_labels) 每个样本标签的pandas DataFrame
+        max_seq_len: 最大序列（时间序列）长度。如果为None，将使用脚本参数`max_seq_len`。
+            （此外，脚本参数会覆盖此属性）
     """
 
     def __init__(self, args, root_path, file_list=None, limit_size=None, flag=None):
+        """
+        初始化UEA数据加载器
+        关键步骤：
+        1. 加载数据：从.ts文件加载原始数据
+        2. 样本ID提取：获取所有唯一的样本ID
+        3. 数据集限制：支持调试时使用部分数据
+        4. 特征设置：使用所有列作为特征
+        5. 标准化：对数据进行标准化处理
+        """
         self.args = args
         self.root_path = root_path
         self.flag = flag
+        
+        # 1. 加载数据：从.ts文件加载原始数据
         self.all_df, self.labels_df = self.load_all(root_path, file_list=file_list, flag=flag)
-        self.all_IDs = self.all_df.index.unique()  # all sample IDs (integer indices 0 ... num_samples-1)
+        
+        # 2. 获取样本ID：所有样本ID（整数索引 0 ... num_samples-1）
+        self.all_IDs = self.all_df.index.unique()
 
+        # 3. 限制数据集大小（用于调试）
         if limit_size is not None:
             if limit_size > 1:
                 limit_size = int(limit_size)
-            else:  # interpret as proportion if in (0, 1]
+            else:  # 如果在(0, 1]范围内，解释为比例
                 limit_size = int(limit_size * len(self.all_IDs))
             self.all_IDs = self.all_IDs[:limit_size]
             self.all_df = self.all_df.loc[self.all_IDs]
 
-        # use all features
+        # 4. 使用所有特征
         self.feature_names = self.all_df.columns
         self.feature_df = self.all_df
 
-        # pre_process
+        # 5. 数据预处理：标准化
         normalizer = Normalizer()
         self.feature_df = normalizer.normalize(self.feature_df)
         print(len(self.all_IDs))
 
     def load_all(self, root_path, file_list=None, flag=None):
         """
-        Loads datasets from ts files contained in `root_path` into a dataframe, optionally choosing from `pattern`
-        Args:
-            root_path: directory containing all individual .ts files
-            file_list: optionally, provide a list of file paths within `root_path` to consider.
-                Otherwise, entire `root_path` contents will be used.
-        Returns:
-            all_df: a single (possibly concatenated) dataframe with all data corresponding to specified files
-            labels_df: dataframe containing label(s) for each sample
+        从`root_path`中包含的ts文件加载数据集到数据框中，可选择从`pattern`中选择
+        参数：
+            root_path: 包含所有单独.ts文件的目录
+            file_list: 可选地，提供`root_path`内要考虑的文件路径列表。
+                否则，将使用整个`root_path`内容。
+        返回：
+            all_df: 包含指定文件所有数据的单个（可能连接的）数据框
+            labels_df: 包含每个样本标签的数据框
         """
-        # Select paths for training and evaluation
+        # 选择训练和评估的路径
         if file_list is None:
-            data_paths = glob.glob(os.path.join(root_path, '*'))  # list of all paths
+            data_paths = glob.glob(os.path.join(root_path, '*'))  # 所有路径的列表
         else:
             data_paths = [os.path.join(root_path, p) for p in file_list]
         if len(data_paths) == 0:
-            raise Exception('No files found using: {}'.format(os.path.join(root_path, '*')))
+            raise Exception('未找到文件: {}'.format(os.path.join(root_path, '*')))
         if flag is not None:
             data_paths = list(filter(lambda x: re.search(flag, x), data_paths))
         input_paths = [p for p in data_paths if os.path.isfile(p) and p.endswith('.ts')]
         if len(input_paths) == 0:
             pattern='*.ts'
-            raise Exception("No .ts files found using pattern: '{}'".format(pattern))
+            raise Exception("使用模式'{}'未找到.ts文件".format(pattern))
 
-        all_df, labels_df = self.load_single(input_paths[0])  # a single file contains dataset
+        # 单个文件包含整个数据集
+        all_df, labels_df = self.load_single(input_paths[0])
 
         return all_df, labels_df
 
     def load_single(self, filepath):
+        """
+        加载单个.ts文件并处理数据
+        关键处理步骤：
+        1. 标签处理：将类别标签转换为数字编码
+        2. 长度检查：处理变长序列问题
+        3. 数据重构：将数据转换为长格式
+        4. 缺失值处理：使用插值填充缺失值
+        """
+        # 1. 从.ts文件加载数据
         df, labels = load_from_tsfile_to_dataframe(filepath, return_separate_X_and_y=True,
                                                              replace_missing_vals_with='NaN')
+        
+        # 2. 处理标签：将类别标签转换为数字编码
         labels = pd.Series(labels, dtype="category")
-        self.class_names = labels.cat.categories
+        self.class_names = labels.cat.categories  # 获取类别名称
         labels_df = pd.DataFrame(labels.cat.codes,
-                                 dtype=np.int8)  # int8-32 gives an error when using nn.CrossEntropyLoss
+                                 dtype=np.int8)  # int8-32在使用nn.CrossEntropyLoss时会产生错误
 
+        # 3. 检查序列长度：(num_samples, num_dimensions) 包含每个序列长度的数组
         lengths = df.applymap(
-            lambda x: len(x)).values  # (num_samples, num_dimensions) array containing the length of each series
+            lambda x: len(x)).values
 
+        # 4. 处理变长序列：检查同一样本的不同维度长度是否不同
         horiz_diffs = np.abs(lengths - np.expand_dims(lengths[:, 0], -1))
 
-        if np.sum(horiz_diffs) > 0:  # if any row (sample) has varying length across dimensions
-            df = df.applymap(subsample)
+        if np.sum(horiz_diffs) > 0:  # 如果任何行（样本）在不同维度上有不同的长度
+            df = df.applymap(subsample)  # 进行子采样
 
+        # 5. 确定最大序列长度
         lengths = df.applymap(lambda x: len(x)).values
         vert_diffs = np.abs(lengths - np.expand_dims(lengths[0, :], 0))
-        if np.sum(vert_diffs) > 0:  # if any column (dimension) has varying length across samples
+        if np.sum(vert_diffs) > 0:  # 如果任何列（维度）在不同样本中有不同的长度
             self.max_seq_len = int(np.max(lengths[:, 0]))
         else:
             self.max_seq_len = lengths[0, 0]
 
-        # First create a (seq_len, feat_dim) dataframe for each sample, indexed by a single integer ("ID" of the sample)
-        # Then concatenate into a (num_samples * seq_len, feat_dim) dataframe, with multiple rows corresponding to the
-        # sample index (i.e. the same scheme as all datasets in this project)
+        # 6. 数据重构：首先为每个样本创建一个(seq_len, feat_dim)数据框，按单个整数索引（样本的"ID"）
+        # 然后连接成(num_samples * seq_len, feat_dim)数据框，多行对应样本索引
+        # （即与此项目中所有数据集相同的方案）
 
         df = pd.concat((pd.DataFrame({col: df.loc[row, col] for col in df.columns}).reset_index(drop=True).set_index(
             pd.Series(lengths[row, 0] * [row])) for row in range(df.shape[0])), axis=0)
 
-        # Replace NaN values
+        # 7. 处理缺失值：替换NaN值
         grp = df.groupby(by=df.index)
         df = grp.transform(interpolate_missing)
 
         return df, labels_df
 
     def instance_norm(self, case):
-        if self.root_path.count('EthanolConcentration') > 0:  # special process for numerical stability
+        """
+        实例标准化：对特定数据集进行特殊的实例标准化
+        特点：对EthanolConcentration数据集进行特殊的数值稳定性处理
+        """
+        if self.root_path.count('EthanolConcentration') > 0:  # 为数值稳定性进行特殊处理
             mean = case.mean(0, keepdim=True)
             case = case - mean
             stdev = torch.sqrt(torch.var(case, dim=1, keepdim=True, unbiased=False) + 1e-5)
@@ -730,19 +763,35 @@ class UEAloader(Dataset):
             return case
 
     def __getitem__(self, ind):
+        """
+        获取单个样本的数据
+        关键特点：
+        1. 按索引获取：通过样本ID获取对应的特征和标签
+        2. 数据增强：支持训练时的数据增强
+        3. 格式转换：将numpy数组转换为torch张量
+        """
+        # 1. 获取特征和标签
         batch_x = self.feature_df.loc[self.all_IDs[ind]].values
         labels = self.labels_df.loc[self.all_IDs[ind]].values
+        
+        # 2. 数据增强（仅在训练时且增强比例大于0）
         if self.flag == "TRAIN" and self.args.augmentation_ratio > 0:
             num_samples = len(self.all_IDs)
             num_columns = self.feature_df.shape[1]
             seq_len = int(self.feature_df.shape[0] / num_samples)
+            
+            # 重塑为3D格式进行增强
             batch_x = batch_x.reshape((1, seq_len, num_columns))
             batch_x, labels, augmentation_tags = run_augmentation_single(batch_x, labels, self.args)
 
             batch_x = batch_x.reshape((1 * seq_len, num_columns))
 
+        # 3. 返回标准化后的数据：将numpy数组转换为torch张量
         return self.instance_norm(torch.from_numpy(batch_x)), \
                torch.from_numpy(labels)
 
     def __len__(self):
+        """
+        返回数据集中的样本数量
+        """
         return len(self.all_IDs)

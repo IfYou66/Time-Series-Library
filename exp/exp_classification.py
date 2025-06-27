@@ -19,6 +19,9 @@ class Exp_Classification(Exp_Basic):
 
     def _build_model(self):
         # model input depends on data
+        # self.args.seq_len - 序列长度
+        # self.args.enc_in - 输入特征维度
+        # self.args.num_class - 类别数量
         train_data, train_loader = self._get_data(flag='TRAIN')
         test_data, test_loader = self._get_data(flag='TEST')
         self.args.seq_len = max(train_data.max_seq_len, test_data.max_seq_len)
