@@ -50,7 +50,7 @@ UEA
 '''
 
 if __name__ == '__main__':
-    fix_seed = 2021
+    fix_seed = 2025
     random.seed(fix_seed)
     torch.manual_seed(fix_seed)
     np.random.seed(fix_seed)
