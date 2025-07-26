@@ -795,3 +795,86 @@ class UEAloader(Dataset):
         返回数据集中的样本数量
         """
         return len(self.all_IDs)
+
+class Dataset_Hell(Dataset):
+    """
+    Hell Bridge Test Arena 多分类加载器
+    每个 CSV 文件对应一个结构状态（总共 10 类），
+    每个长时序按固定窗口 seq_len 划分成样本。
+    """
+    def __init__(self, args, root_path, flag='TRAIN'):
+        """
+        args.seq_len: 每个样本的长度
+        flag: 'TRAIN' 或 'TEST' (目前不做区分，只在需要时用于数据增强)
+        """
+        super().__init__()
+        self.args = args
+        self.root = root_path
+        self.flag = flag.upper()
+
+        # 1) 扫描所有 CSV 文件
+        pattern = os.path.join(self.root, 'MVS_P2_*.csv')
+        self.file_paths = sorted(glob.glob(pattern))
+        assert len(self.file_paths)==10, f"Expected 10 CSVs, found {len(self.file_paths)}"
+
+        # 2) 根据文件名生成标签映射
+        #    UDS_NM_Z_01 -> 0, UDS_NM_Z_02 -> 1, DS1->2, …, DS8->9
+        self.label_map = {}
+        for path in self.file_paths:
+            fn = os.path.basename(path)
+            if 'UDS_NM_Z_01' in fn:
+                self.label_map[fn] = 0
+            elif 'UDS_NM_Z_02' in fn:
+                self.label_map[fn] = 1
+            else:
+                m = re.search(r'DS([1-8])', fn)
+                assert m, f"Unrecognized filename {fn}"
+                self.label_map[fn] = int(m.group(1)) + 1
+
+        # 3) 读第一份确定时序总长度与特征维度
+        df0 = pd.read_csv(self.file_paths[0], header=None)
+        total_len, feat_dim = df0.shape
+
+        # 4) 样本划分：每个文件按 seq_len 等分
+        self.seq_len = args.seq_len
+        self.windows_per_file = total_len // self.seq_len
+        self.total_samples = len(self.file_paths) * self.windows_per_file
+
+        # 5) 为 Exp_Classification._build_model 提供属性
+        #    - max_seq_len：最大的序列长度（分类时 padding 会用到）
+        #    - feature_df：只要有 .shape[1] 属性即可，classification 里取它当 enc_in
+        #    - class_names：长度决定 num_class
+        self.max_seq_len = self.seq_len
+        # 构造一个空 DataFrame，只为了 .shape[1] == feat_dim
+        self.feature_df = pd.DataFrame(np.zeros((1, feat_dim)))
+        # 类名列表（order 不必和 label_map 顺序一致，但要和 mapping 一一对应）
+        self.class_names = [os.path.basename(p) for p in self.file_paths]
+
+    def __len__(self):
+        return self.total_samples
+
+    def __getitem__(self, idx):
+        """
+        返回一个样本：
+        - x: Tensor[seq_len, feat_dim]
+        - y: LongTensor () 单个标签
+        collate_fn 会负责 padding/truncate 和生成 mask
+        """
+        file_idx = idx // self.windows_per_file
+        win_idx  = idx % self.windows_per_file
+        path = self.file_paths[file_idx]
+        fn   = os.path.basename(path)
+
+        # 1) 读 CSV
+        df = pd.read_csv(path, header=None)
+        data = df.values  # np.ndarray [total_len, feat_dim]
+
+        # 2) 切窗口
+        start = win_idx * self.seq_len
+        segment = data[start:start+self.seq_len, :]  # [seq_len, feat_dim]
+
+        # 3) 转 Tensor
+        x = torch.from_numpy(segment).float()
+        y = torch.tensor(self.label_map[fn], dtype=torch.long)
+
+        return x, y
