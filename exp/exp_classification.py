@@ -111,7 +111,7 @@ class Exp_Classification(Exp_Basic):
                 padding_mask = padding_mask.float().to(self.device)
                 label = label.to(self.device)
 
-                print("batch_x", batch_x.shape)
+                # print("batch_x", batch_x.shape)
                 outputs = self.model(batch_x, padding_mask, None, None)
                 loss = criterion(outputs, label.long().squeeze(-1))
                 train_loss.append(loss.item())
