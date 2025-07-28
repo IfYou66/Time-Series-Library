@@ -800,80 +800,178 @@ class UEAloader(Dataset):
 class Dataset_Hell(Dataset):
     """
     Hell Bridge Test Arena 多分类数据集加载器
-    每个 CSV 文件对应一个结构状态（共 10 类），
-    将每条长时序按固定窗口 seq_len 划分成样本。
+    每个 CSV 对应一个状态（10 类），
+    将每条长时序按固定窗口 seq_len 划分，并在 TRAIN/VAL/TEST 三种模式下完成 70%/15%/15% 划分。
     """
 
     def __init__(self, args, root_path, flag='TRAIN'):
-        """
-        args.seq_len: 每个样本的长度
-        flag: 'TRAIN' 或 'TEST'（暂未用于数据增强）
-        """
         super().__init__()
         self.args = args
         self.root = root_path
         self.flag = flag.upper()
+        assert self.flag in ('TRAIN','VAL','TEST'), f"flag must be TRAIN/VAL/TEST, got {flag}"
 
-        # 1) 查找所有 CSV 文件
+        # 1) 找到所有 CSV
         pattern = os.path.join(self.root, 'MVS_P2_*.csv')
         self.file_paths = sorted(glob.glob(pattern))
-        assert len(self.file_paths) == 10, f"Expected 10 CSVs, found {len(self.file_paths)}"
+        assert len(self.file_paths)==10, f"Expected 10 CSVs, found {len(self.file_paths)}"
 
-        # 2) 按文件名生成标签和类别名称
+        # 2) 生成每个文件的标签
         self.labels = []
         self.class_names = []
-        for path in self.file_paths:
-            fn = os.path.basename(path)
-            if 'UDS_NM_Z_01' in fn:
-                label = 0
-            elif 'UDS_NM_Z_02' in fn:
-                label = 1
+        for p in self.file_paths:
+            fn = os.path.basename(p)
+            if 'UDS_NM_Z_01' in fn:    lbl=0
+            elif 'UDS_NM_Z_02' in fn:  lbl=1
             else:
-                m = re.search(r'DS([1-8])', fn)
-                assert m, f"Unrecognized filename {fn}"
-                label = int(m.group(1)) + 1
-            self.labels.append(label)
+                m=re.search(r'DS([1-8])',fn)
+                assert m, f"Bad filename {fn}"
+                lbl=int(m.group(1))+1
+            self.labels.append(lbl)
             self.class_names.append(fn)
 
-        # 3) 读取第一份 CSV 确定时序总长度和特征维度
-        df0 = pd.read_csv(self.file_paths[0], header=None)
+        # 3) 读首个文件拿总长度 & 特征维
+        df0 = pd.read_csv(self.file_paths[0],header=None)
         total_len, feat_dim = df0.shape
 
-        # 4) 样本划分：每个文件按 seq_len 等分
+        # 4) 计算非重叠窗口数
         self.seq_len = args.seq_len
-        self.windows_per_file = total_len // self.seq_len
-        self.total_samples = len(self.file_paths) * self.windows_per_file
+        n = total_len // self.seq_len
+        assert n>0, "seq_len太大，得不到任何窗口"
 
-        # 5) 一次性把所有数据读入内存，加速 __getitem__
-        arrays = []
-        for path in self.file_paths:
-            df = pd.read_csv(path, header=None)
-            arrays.append(df.values)  # shape (total_len, feat_dim)
-        # shape => (num_files, total_len, feat_dim)
-        self.data = np.stack(arrays, axis=0)
+        # 5) 按比例划分：round 避免全部向下取整
+        train_r, val_r, test_r = 0.7, 0.15, 0.15
+        n_train = max(1, round(n*train_r))
+        n_val   = max(1, round(n*val_r))
+        # 剩余给 test
+        n_test  = n - n_train - n_val
+        # 若出现负数（四舍五入导致），再调整
+        if n_test<1:
+            n_test=1
+            # 重新保证总和
+            if n_train + n_val + n_test > n:
+                # 优先保证 train，再 val，再 test
+                overflow = n_train+n_val+n_test - n
+                for _ in range(overflow):
+                    if n_test>1: n_test-=1
+                    elif n_val>1: n_val-=1
+                    else: n_train = max(1,n_train-1)
 
-        # 6) 配合 Exp_Classification，需要以下属性
+        # 6) 读入所有数据
+        self.data = []
+        for p in self.file_paths:
+            df = pd.read_csv(p,header=None)
+            self.data.append(df.values)
+        self.data = np.stack(self.data,axis=0)  # (10, total_len, feat_dim)
+        self.windows_per_file = n
+
+        # 7) 构造本 flag 下的全局 idx 列表
+        self.indices = []
+        for f_idx in range(len(self.file_paths)):
+            if self.flag=='TRAIN':
+                wins = range(0, n_train)
+            elif self.flag=='VAL':
+                wins = range(n_train, n_train+n_val)
+            else:  # TEST
+                wins = range(n_train+n_val, n)
+            for w in wins:
+                self.indices.append(f_idx*n + w)
+
+        # 8) 供 Exp_Classification 读取用
         self.max_seq_len = self.seq_len
-        # 只需一个 placeholder DataFrame 来提供 .shape[1] 作为 enc_in
-        self.feature_df = pd.DataFrame(np.zeros((1, feat_dim)))
+        self.feature_df  = pd.DataFrame(np.zeros((1, feat_dim)))
 
     def __len__(self):
-        return self.total_samples
+        return len(self.indices)
 
     def __getitem__(self, idx):
-        """
-        返回：
-            x: FloatTensor [seq_len, feat_dim]
-            y: LongTensor () 单个标签
-        collate_fn 会负责 padding/truncate 并返回 padding_mask
-        """
-        file_idx = idx // self.windows_per_file
-        win_idx  = idx % self.windows_per_file
-
-        arr = self.data[file_idx]  # [total_len, feat_dim]
-        start = win_idx * self.seq_len
-        segment = arr[start:start + self.seq_len, :]  # [seq_len, feat_dim]
-
-        x = torch.from_numpy(segment).float()
-        y = torch.tensor(self.labels[file_idx], dtype=torch.long)
+        g = self.indices[idx]
+        f_idx = g // self.windows_per_file
+        w_idx = g %  self.windows_per_file
+        arr   = self.data[f_idx]  # (total_len,feat_dim)
+        start = w_idx * self.seq_len
+        seg   = arr[start:start+self.seq_len]
+        x = torch.from_numpy(seg).float()
+        y = torch.tensor(self.labels[f_idx],dtype=torch.long)
         return x, y
+
+# class Dataset_Hell(Dataset):
+#     """
+#     Hell Bridge Test Arena 多分类数据集加载器
+#     每个 CSV 文件对应一个结构状态（共 10 类），
+#     将每条长时序按固定窗口 seq_len 划分成样本。
+#     """
+#
+#     def __init__(self, args, root_path, flag='TRAIN'):
+#         """
+#         args.seq_len: 每个样本的长度
+#         flag: 'TRAIN' 或 'TEST'（暂未用于数据增强）
+#         """
+#         super().__init__()
+#         self.args = args
+#         self.root = root_path
+#         self.flag = flag.upper()
+#
+#         # 1) 查找所有 CSV 文件
+#         pattern = os.path.join(self.root, 'MVS_P2_*.csv')
+#         self.file_paths = sorted(glob.glob(pattern))
+#         assert len(self.file_paths) == 10, f"Expected 10 CSVs, found {len(self.file_paths)}"
+#
+#         # 2) 按文件名生成标签和类别名称
+#         self.labels = []
+#         self.class_names = []
+#         for path in self.file_paths:
+#             fn = os.path.basename(path)
+#             if 'UDS_NM_Z_01' in fn:
+#                 label = 0
+#             elif 'UDS_NM_Z_02' in fn:
+#                 label = 1
+#             else:
+#                 m = re.search(r'DS([1-8])', fn)
+#                 assert m, f"Unrecognized filename {fn}"
+#                 label = int(m.group(1)) + 1
+#             self.labels.append(label)
+#             self.class_names.append(fn)
+#
+#         # 3) 读取第一份 CSV 确定时序总长度和特征维度
+#         df0 = pd.read_csv(self.file_paths[0], header=None)
+#         total_len, feat_dim = df0.shape
+#
+#         # 4) 样本划分：每个文件按 seq_len 等分
+#         self.seq_len = args.seq_len
+#         self.windows_per_file = total_len // self.seq_len
+#         self.total_samples = len(self.file_paths) * self.windows_per_file
+#
+#         # 5) 一次性把所有数据读入内存，加速 __getitem__
+#         arrays = []
+#         for path in self.file_paths:
+#             df = pd.read_csv(path, header=None)
+#             arrays.append(df.values)  # shape (total_len, feat_dim)
+#         # shape => (num_files, total_len, feat_dim)
+#         self.data = np.stack(arrays, axis=0)
+#
+#         # 6) 配合 Exp_Classification，需要以下属性
+#         self.max_seq_len = self.seq_len
+#         # 只需一个 placeholder DataFrame 来提供 .shape[1] 作为 enc_in
+#         self.feature_df = pd.DataFrame(np.zeros((1, feat_dim)))
+#
+#     def __len__(self):
+#         return self.total_samples
+#
+#     def __getitem__(self, idx):
+#         """
+#         返回：
+#             x: FloatTensor [seq_len, feat_dim]
+#             y: LongTensor () 单个标签
+#         collate_fn 会负责 padding/truncate 并返回 padding_mask
+#         """
+#         file_idx = idx // self.windows_per_file
+#         win_idx  = idx % self.windows_per_file
+#
+#         arr = self.data[file_idx]  # [total_len, feat_dim]
+#         start = win_idx * self.seq_len
+#         segment = arr[start:start + self.seq_len, :]  # [seq_len, feat_dim]
+#
+#         x = torch.from_numpy(segment).float()
+#         y = torch.tensor(self.labels[file_idx], dtype=torch.long)
+#         return x, y
