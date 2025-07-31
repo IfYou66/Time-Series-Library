@@ -1,3 +1,5 @@
+# model/timesnet_plus.py
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -5,226 +7,190 @@ import torch.fft
 from layers.Embed import DataEmbedding
 from layers.Conv_Blocks import Inception_Block_V1
 
+# ------------------------------------------------------------
+# 1) 序列分解模块：SeriesDecomp
+# ------------------------------------------------------------
+class SeriesDecomp(nn.Module):
+    def __init__(self, kernel_size: int):
+        super(SeriesDecomp, self).__init__()
+        self.kernel_size = kernel_size
+        # 1D 移动平均，padding='same'
+        self.avg_pool = nn.AvgPool1d(
+            kernel_size=kernel_size, stride=1,
+            padding=(kernel_size - 1) // 2, count_include_pad=False
+        )
 
-def FFT_for_Period(x, k=2):
+    def forward(self, x: torch.Tensor):
+        """
+        x: [B, T, C]
+        return:
+          x_seasonal: [B, T, C], 去趋势后的季节成分
+          x_trend:    [B, T, C], 平滑出的趋势成分
+        """
+        # 转到 [B, C, T] 做 1D 平均池化
+        x_perm = x.permute(0, 2, 1)  # [B, C, T]
+        trend = self.avg_pool(x_perm)  # [B, C, T]
+        trend = trend.permute(0, 2, 1)  # [B, T, C]
+        seasonal = x - trend
+        return seasonal, trend
+
+# ------------------------------------------------------------
+# 2) 自相关函数：Auto-Correlation
+# ------------------------------------------------------------
+def auto_correlation(x: torch.Tensor, k: int):
     """
-    使用FFT检测时间序列的主要周期
-    核心思想：通过频域分析找到时间序列的主要频率成分
-
-    参数：
-        x: 输入张量 [B, T, C] - 批次大小、时间步长、特征维度
-        k: 返回前k个主要周期
-
-    返回：
-        period: 主要周期列表
-        period_weight: 对应的权重
+    基于 Wiener–Khinchin：通过频谱反变换一次计算所有滞后自相关，
+    再 Top-k 选出主周期，并按 softmax 归一化权重。
+    x: [B, T, C]
+    return:
+      periods: List[int]  长度=k 的滞后列表
+      weights: Tensor    [k]  对应的 softmax 权重
     """
-    xf = torch.fft.rfft(x, dim=1)  # 对时间维度进行FFT变换
-    frequency_list = xf.abs().mean(0).mean(-1)  # 计算每个频率的平均振幅
-    frequency_list[0] = 0  # 将直流分量（频率0）设为0
-    _, top_list = torch.topk(frequency_list, k)  # 找到前k个最大振幅的频率
-    top_list = top_list.detach().cpu().numpy()
-    period = x.shape[1] // top_list  # 计算对应的周期长度
-    return period, xf.abs().mean(-1)[:, top_list]  # 返回周期和对应的权重
+    B, T, C = x.shape
+    # FFT 获得频谱
+    Xf = torch.fft.rfft(x, dim=1)            # [B, F, C]
+    P = Xf * torch.conj(Xf)                  # [B, F, C]
+    P_mean = P.mean(0).mean(-1)              # [F]
+    # 反变换到时域，得自相关 r(τ) for τ=0..T-1
+    r = torch.fft.irfft(P_mean, n=T, dim=0)  # [T]
+    r[0] = 0  # 忽略 0 滞后
+    # Top-k 滞后
+    vals, idx = torch.topk(r, k)            # each scalar
+    weights = F.softmax(vals, dim=0)         # [k]
+    periods = idx.tolist()                  # 转成 Python list
+    return periods, weights
 
-
+# ------------------------------------------------------------
+# 3) TimesBlock（融合 SeriesDecomp、Auto-Corr、2D PosEncoding）
+# ------------------------------------------------------------
 class TimesBlock(nn.Module):
-    """
-    TimesNet的核心模块：将1D时间序列转换为2D表示进行处理，
-    并在2D→1D聚合后加入SE通道注意力
-    """
     def __init__(self, configs):
         super(TimesBlock, self).__init__()
-        self.seq_len  = configs.seq_len
+        self.seq_len = configs.seq_len
         self.pred_len = configs.pred_len
-        self.k        = configs.top_k
+        self.k = configs.top_k                   # Top-k 周期数
+        self.kernel_size = configs.moving_avg  # 分解移动平均窗口
 
-        # 2D 多尺度卷积
+        # 3.1 内置分解
+        self.series_decomp = SeriesDecomp(self.kernel_size)
+
+        # 3.2 2D 可学习位置编码（行：周期索引，列：相位索引）
+        #    允许最大周期数=seq_len, 最大周期长度=seq_len
+        self.pos_col = nn.Parameter(torch.randn(1, 1, configs.seq_len, 1))
+        self.pos_row = nn.Parameter(torch.randn(1, 1, 1, configs.seq_len))
+
+        # 3.3 2D 卷积模块（原 Inception）
         self.conv = nn.Sequential(
-            Inception_Block_V1(configs.d_model, configs.d_ff,
-                               num_kernels=configs.num_kernels),
+            Inception_Block_V1(configs.d_model, configs.d_ff, num_kernels=configs.num_kernels),
             nn.GELU(),
-            Inception_Block_V1(configs.d_ff, configs.d_model,
-                               num_kernels=configs.num_kernels)
+            Inception_Block_V1(configs.d_ff, configs.d_model, num_kernels=configs.num_kernels),
         )
 
-        # SE 通道注意力
-        C = configs.d_model
-        r = getattr(configs, 'se_ratio', 16)
-        self.se = nn.Sequential(
-            nn.AdaptiveAvgPool1d(1),         # [B, C, 1]
-            nn.Conv1d(C, C // r, kernel_size=1),
-            nn.ReLU(inplace=True),
-            nn.Conv1d(C // r, C, kernel_size=1),
-            nn.Sigmoid()
-        )
+    def forward(self, x: torch.Tensor):
+        """
+        x: [B, T, C]
+        """
+        B, T, C = x.shape
 
-    def forward(self, x):
-        """
-        1) FFT周期检测
-        2) 1D→2D转换 & 2D卷积
-        3) 2D→1D转换 & 周期加权聚合
-        4) SE通道注意力
-        5) 残差连接
-        """
-        B, T, C_in = x.size()
-        period_list, period_weight = FFT_for_Period(x, self.k)
+        # —— 1) 内置分解：先提取趋势并剥离季节
+        x_seasonal, x_trend = self.series_decomp(x)  # [B,T,C] x2
+
+        # —— 2) 自相关找周期
+        periods, weights = auto_correlation(x_seasonal, self.k)
+        # weights: [k]
 
         outs = []
-        L = self.seq_len + self.pred_len
-        for i in range(self.k):
-            p = int(period_list[i])
-            if L % p != 0:
-                Lp = ((L // p) + 1) * p
-                pad = torch.zeros(B, Lp - L, C_in, device=x.device)
-                xi = torch.cat([x, pad], dim=1)
+        for i, p in enumerate(periods):
+            # —— (a) roll 对齐：将季节信号按周期对齐
+            rolled = torch.roll(x_seasonal, -p, dims=1)
+
+            # —— (b) pad & reshape to 2D：->[B, C, cycles, p]
+            total_len = self.seq_len + self.pred_len
+            if total_len % p != 0:
+                pad_len = ( (total_len // p + 1)*p - total_len )
+                padded = F.pad(rolled, (0,0,0,pad_len))  # pad 时间维度前
             else:
-                Lp = L
-                xi = x
+                padded = rolled
+            cycles = padded.shape[1] // p
+            out2d = padded.reshape(B, cycles, p, C).permute(0,3,1,2).contiguous()  # [B,C,cycles,p]
 
-            # 1D→2D reshape to [B, C_in, num_periods, p]
-            xi = xi.reshape(B, Lp // p, p, C_in).permute(0, 3, 1, 2).contiguous()
-            xi = self.conv(xi)
-            # 2D→1D reshape back to [B, Lp, C_in]
-            xi = xi.permute(0, 2, 3, 1).reshape(B, -1, C_in)
-            outs.append(xi[:, :L, :])
+            # —— (c) 加二维位置编码
+            #    pos_col: [1,1,max_cycles,1], pos_row: [1,1,1,max_p]
+            out2d = out2d + self.pos_col[:,:,:cycles,:] + self.pos_row[:,:,:,:p]
 
-        # stack & period-weighted sum → [B, T, C_in]
-        out = torch.stack(outs, dim=-1)                 # [B, T, C_in, k]
-        w   = F.softmax(period_weight, dim=1)           # [B, k]
-        w   = w.unsqueeze(1).unsqueeze(1).repeat(1, T, C_in, 1)
-        out = (out * w).sum(dim=-1)                     # [B, T, C_in]
+            # —— (d) 2D 卷积提取
+            conv2d = self.conv(out2d)  # [B,C,cycles,p]
 
-        # SE 通道注意力
-        out_ca    = out.permute(0, 2, 1)                # [B, C_in, T]
-        se_w      = self.se(out_ca)                    # [B, C_in, 1]
-        out_ca    = out_ca * se_w                       # [B, C_in, T]
-        out       = out_ca.permute(0, 2, 1)             # [B, T, C_in]
+            # —— (e) reshape 回 1D
+            back = conv2d.permute(0,2,3,1).reshape(B, cycles*p, C)
+            outs.append(back[:, :total_len, :])  # 裁到 [B, total_len, C]
 
-        # 残差连接
-        return out + x
+        # —— 3) 多周期聚合：按权重加权
+        stack = torch.stack(outs, dim=-1)          # [B, L, C, k]
+        w = weights.view(1,1,1,self.k).to(x.device)
+        agg = (stack * w).sum(-1)                  # [B, L, C]
 
+        # —— 4) 加回趋势 & 残差
+        #      4.1 加回趋势部分
+        out = agg + x_trend
+        #      4.2 残差连接
+        out = out + x
 
+        return out
+
+# ------------------------------------------------------------
+# 4) 主模型：Model（仅 classification 部分显示关键插入）
+# ------------------------------------------------------------
 class Model(nn.Module):
-    """
-    TimesNet主模型
-    支持：long_term_forecast, short_term_forecast,
-          imputation, anomaly_detection, classification
-    """
     def __init__(self, configs):
         super(Model, self).__init__()
-        self.configs   = configs
+        self.configs = configs
         self.task_name = configs.task_name
-        self.seq_len   = configs.seq_len
-        self.label_len = configs.label_len
-        self.pred_len  = configs.pred_len
+        self.seq_len = configs.seq_len
+        self.pred_len = configs.pred_len
 
-        # 1. 核心TimesBlock层
-        self.model = nn.ModuleList([
-            TimesBlock(configs) for _ in range(configs.e_layers)
-        ])
-
-        # 2. 数据嵌入
+        # 嵌入层
         self.enc_embedding = DataEmbedding(
             configs.enc_in, configs.d_model,
-            configs.embed, configs.freq,
-            configs.dropout
+            configs.embed, configs.freq, configs.dropout
         )
+
+        # N 层 TimesBlock
+        self.blocks = nn.ModuleList([
+            TimesBlock(configs) for _ in range(configs.e_layers)
+        ])
         self.layer_norm = nn.LayerNorm(configs.d_model)
 
-        # 3. 任务专属Head
-        if self.task_name in ('long_term_forecast', 'short_term_forecast'):
-            self.predict_linear = nn.Linear(
-                self.seq_len, self.pred_len + self.seq_len
-            )
-            self.projection = nn.Linear(
-                configs.d_model, configs.c_out, bias=True
-            )
-
-        if self.task_name in ('imputation', 'anomaly_detection'):
-            self.projection = nn.Linear(
-                configs.d_model, configs.c_out, bias=True
-            )
-
+        # 分类头
         if self.task_name == 'classification':
-            self.act       = F.gelu
-            self.dropout   = nn.Dropout(configs.dropout)
+            self.act = F.gelu
+            self.dropout = nn.Dropout(configs.dropout)
             self.projection = nn.Linear(
                 configs.d_model * configs.seq_len,
                 configs.num_class
             )
 
-    def forecast(self, x_enc, x_mark_enc, x_dec, x_mark_dec):
-        # ——— 与原版完全相同 ———
-        means = x_enc.mean(1, keepdim=True).detach()
-        x_enc = x_enc.sub(means)
-        stdev = torch.sqrt(torch.var(x_enc, dim=1, keepdim=True, unbiased=False) + 1e-5)
-        x_enc = x_enc.div(stdev)
-
-        enc_out = self.enc_embedding(x_enc, x_mark_enc)
-        enc_out = self.predict_linear(enc_out.permute(0,2,1)).permute(0,2,1)
-        for blk in self.model:
-            enc_out = self.layer_norm(blk(enc_out))
-        dec_out = self.projection(enc_out)
-
-        dec_out = dec_out.mul(stdev[:,0,:].unsqueeze(1).repeat(1,self.pred_len+self.seq_len,1))
-        dec_out = dec_out.add(means[:,0,:].unsqueeze(1).repeat(1,self.pred_len+self.seq_len,1))
-        return dec_out
-
-    def imputation(self, x_enc, x_mark_enc, x_dec, x_mark_dec, mask):
-        # ——— 与原版完全相同 ———
-        means = torch.sum(x_enc, dim=1) / torch.sum(mask==1, dim=1)
-        means = means.unsqueeze(1).detach()
-        x_enc = x_enc.sub(means).masked_fill(mask==0, 0)
-        stdev = torch.sqrt(torch.sum(x_enc*x_enc, dim=1)/torch.sum(mask==1, dim=1) + 1e-5)
-        stdev = stdev.unsqueeze(1).detach()
-        x_enc = x_enc.div(stdev)
-
-        enc_out = self.enc_embedding(x_enc, x_mark_enc)
-        for blk in self.model:
-            enc_out = self.layer_norm(blk(enc_out))
-        dec_out = self.projection(enc_out)
-
-        dec_out = dec_out.mul(stdev[:,0,:].unsqueeze(1).repeat(1,self.pred_len+self.seq_len,1))
-        dec_out = dec_out.add(means[:,0,:].unsqueeze(1).repeat(1,self.pred_len+self.seq_len,1))
-        return dec_out
-
-    def anomaly_detection(self, x_enc):
-        # ——— 与原版完全相同 ———
-        means = x_enc.mean(1, keepdim=True).detach()
-        x_enc = x_enc.sub(means)
-        stdev = torch.sqrt(torch.var(x_enc, dim=1, keepdim=True, unbiased=False) + 1e-5)
-        x_enc = x_enc.div(stdev)
-
-        enc_out = self.enc_embedding(x_enc, None)
-        for blk in self.model:
-            enc_out = self.layer_norm(blk(enc_out))
-        dec_out = self.projection(enc_out)
-
-        dec_out = dec_out.mul(stdev[:,0,:].unsqueeze(1).repeat(1,self.pred_len+self.seq_len,1))
-        dec_out = dec_out.add(means[:,0,:].unsqueeze(1).repeat(1,self.pred_len+self.seq_len,1))
-        return dec_out
-
-    def classification(self, x_enc, x_mark_enc):
-        # ——— 与原版完全相同 ———
-        enc_out = self.enc_embedding(x_enc, None)
-        for blk in self.model:
-            enc_out = self.layer_norm(blk(enc_out))
-        out = self.act(enc_out)
+    def classification(self, x_enc, x_mask):
+        """
+        x_enc: [B, T, C], x_mask: [B, T]（padding mask）
+        """
+        # 1) 嵌入
+        enc = self.enc_embedding(x_enc, None)  # 时间标记对分类可选
+        # 2) N 层 TimesBlock
+        for blk in self.blocks:
+            enc = self.layer_norm(blk(enc))
+        # 3) 非线性 + Dropout + Mask
+        out = self.act(enc)
         out = self.dropout(out)
-        out = out * x_mark_enc.unsqueeze(-1)
-        out = out.reshape(out.size(0), -1)
+        out = out * x_mask.unsqueeze(-1)
+        # 4) 展平 & 分类
+        out = out.reshape(out.shape[0], -1)
         out = self.projection(out)
         return out
 
-    def forward(self, x_enc, x_mark_enc, x_dec=None, x_mark_dec=None, mask=None):
-        if self.task_name in ('long_term_forecast','short_term_forecast'):
-            dec_out = self.forecast(x_enc, x_mark_enc, x_dec, x_mark_dec)
-            return dec_out[:, -self.pred_len:, :]
-        if self.task_name == 'imputation':
-            return self.imputation(x_enc, x_mark_enc, x_dec, x_mark_dec, mask)
-        if self.task_name == 'anomaly_detection':
-            return self.anomaly_detection(x_enc)
+    def forward(self, x_enc, x_mask, *args):
         if self.task_name == 'classification':
-            return self.classification(x_enc, x_mark_enc)
-        return None
+            return self.classification(x_enc, x_mask)
+        else:
+            raise NotImplementedError(f"Task {self.task_name} not supported in this variant.")
+
