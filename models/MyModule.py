@@ -19,6 +19,7 @@ def FFT_for_Period(x, k):
     return period, xf.abs().mean(-1)[:, top_list]  # ([k], [B, k])
 
 
+
 class TimesBlock(nn.Module):
     """
     多尺度 TimesNet 核心模块。并行多组 top-k → concat → 1x1 融合 → SE 注意力 → 残差。
