@@ -4,6 +4,25 @@ import torch.nn.functional as F
 from typing import Tuple
 
 # =========================
+# 工具：安全的 GroupNorm 组数选择（保证可整除）
+# =========================
+def _best_gn_groups(C: int) -> int:
+    for g in [32, 16, 8, 4, 2, 1]:
+        if C % g == 0:
+            return g
+    return 1
+
+# =========================
+# 残差缩放（LayerScale 风格）
+# =========================
+class ResidualScale(nn.Module):
+    def __init__(self, channels: int, init: float = 1e-3):
+        super().__init__()
+        self.gamma = nn.Parameter(torch.ones(1, channels, 1, 1) * init)
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return x * self.gamma
+
+# =========================
 # 1) 序列分解
 # =========================
 class SeriesDecomp(nn.Module):
@@ -16,7 +35,7 @@ class SeriesDecomp(nn.Module):
 
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         # x: [B,T,C]
-        x_nct = x.permute(0, 2, 1)                   # [B,C,T]
+        x_nct = x.permute(0, 2, 1)                     # [B,C,T]
         trend = self.avg_pool(x_nct).permute(0, 2, 1)  # [B,T,C]
         seasonal = x - trend
         return seasonal, trend
@@ -33,15 +52,15 @@ def auto_correlation(x: torch.Tensor, k: int, min_p: int = 3, max_p: int = None)
       w  : [B, k]   自相关峰值 softmax 权重（先验）
     """
     B, T, C = x.shape
-    device, dtype = x.device, x.dtype
+    dtype = x.dtype
     if max_p is None:
         max_p = max(1, T // 2)
     max_p = max(min_p, min(max_p, T - 1))
 
-    Xf = torch.fft.rfft(x, dim=1)                # [B,F,C]
-    P = (Xf * torch.conj(Xf)).real               # [B,F,C]
-    Pm = P.mean(dim=-1)                          # [B,F]（如需更强可做可学习通道加权）
-    r = torch.fft.irfft(Pm, n=T, dim=1)          # [B,T]
+    Xf = torch.fft.rfft(x, dim=1)                  # [B,F,C]
+    P = (Xf * torch.conj(Xf)).real                 # [B,F,C]
+    Pm = P.mean(dim=-1)                            # [B,F]（如需更强可做可学习通道加权）
+    r = torch.fft.irfft(Pm, n=T, dim=1)            # [B,T]
 
     # 合法掩码
     mask = torch.ones_like(r, dtype=torch.bool)
@@ -106,6 +125,8 @@ class SEBlock(nn.Module):
     def __init__(self, channels: int, reduction: int = 8):
         super().__init__()
         hidden = max(reduction, channels // 4)
+        g = _best_gn_groups(channels)
+        # 用 Conv2d 实现 SE，保持轻量
         self.fc = nn.Sequential(
             nn.AdaptiveAvgPool2d(1),              # [B,C,1,1]
             nn.Conv2d(channels, hidden, 1, bias=False), nn.GELU(),
@@ -119,10 +140,10 @@ class SEBlock(nn.Module):
 
 
 # =========================
-# 5) SK 融合（可注入先验）
+# 5) SK 融合（支持温度/先验）
 # =========================
 class SKMerge(nn.Module):
-    def __init__(self, channels: int, n_branches: int = 3, reduction: int = 8):
+    def __init__(self, channels: int, n_branches: int = 3, reduction: int = 8, tau: float = 1.5):
         super().__init__()
         hidden = max(reduction, channels // 4)
         self.squeeze = nn.Sequential(
@@ -133,6 +154,7 @@ class SKMerge(nn.Module):
         )
         self.n = n_branches
         self.alpha = nn.Parameter(torch.tensor(0.5))  # 频谱先验权重（如需）
+        self.tau = tau                                # softmax 温度：>1 更均匀，<1 更尖锐
 
     def forward(self, feats, w_prior: torch.Tensor = None):
         """
@@ -149,49 +171,60 @@ class SKMerge(nn.Module):
             elif w_prior.dim() == 5 and w_prior.size(1) == 1:  # [B,1,1,1,1]
                 w_prior = w_prior.expand(B, self.n, C, 1, 1)
             a = a + self.alpha * w_prior
-        w = torch.softmax(a, dim=1)                    # [B,n,C,1,1]
+        # 温度软化
+        w = torch.softmax(a / self.tau, dim=1)          # [B,n,C,1,1]
         out = sum(w[:, i] * feats[i] for i in range(self.n))   # [B,C,cyc,p]
         return out
 
 
 # =========================
-# 6) Inception 2D 残差块（多尺度 + SK + SE）
+# 6) Inception 2D 残差块（多尺度 + SK + SE）+ Pre-Norm + 残差缩放
 # =========================
 class Inception2dResBlock_SKSE(nn.Module):
-    def __init__(self, channels: int, drop: float = 0.0):
+    def __init__(self, channels: int, drop: float = 0.0, sk_tau: float = 1.5, se_strength: float = 0.0):
         super().__init__()
         C = channels
+        g = _best_gn_groups(C)
+
+        # Pre-Norm
+        self.pre = nn.GroupNorm(num_groups=g, num_channels=C)
+
         # 三个深度可分离分支
         self.b3   = nn.Sequential(
             nn.Conv2d(C, C, kernel_size=3, padding=1, groups=C, bias=False),
-            nn.GroupNorm(num_groups=min(32, C), num_channels=C), nn.GELU()
+            nn.GroupNorm(num_groups=g, num_channels=C), nn.GELU()
         )
         self.b5   = nn.Sequential(
             nn.Conv2d(C, C, kernel_size=5, padding=2, groups=C, bias=False),
-            nn.GroupNorm(num_groups=min(32, C), num_channels=C), nn.GELU()
+            nn.GroupNorm(num_groups=g, num_channels=C), nn.GELU()
         )
         self.bDil = nn.Sequential(
             nn.Conv2d(C, C, kernel_size=3, padding=2, dilation=2, groups=C, bias=False),
-            nn.GroupNorm(num_groups=min(32, C), num_channels=C), nn.GELU()
+            nn.GroupNorm(num_groups=g, num_channels=C), nn.GELU()
         )
-        self.sk   = SKMerge(C, n_branches=3, reduction=max(8, C // 4))
+        self.sk   = SKMerge(C, n_branches=3, reduction=max(8, C // 4), tau=sk_tau)
         self.merge_pw = nn.Conv2d(C, C, kernel_size=1, bias=False)
-        self.merge_gn = nn.GroupNorm(num_groups=min(32, C), num_channels=C)
+        self.merge_gn = nn.GroupNorm(num_groups=g, num_channels=C)
         self.drop = nn.Dropout2d(drop) if drop > 0 else nn.Identity()
 
         # 第二阶段轻量卷积
         self.dw   = nn.Conv2d(C, C, kernel_size=3, padding=1, groups=C, bias=False)
         self.pw   = nn.Conv2d(C, C, kernel_size=1, bias=False)
-        self.gn2  = nn.GroupNorm(num_groups=min(32, C), num_channels=C)
+        self.gn2  = nn.GroupNorm(num_groups=g, num_channels=C)
         self.act  = nn.GELU()
 
-        # 通道 SE 门控
+        # 通道 SE 门控（强度可控）
         self.se = SEBlock(C, reduction=max(8, C // 4))
+        self.se_strength = se_strength
+
+        # 残差缩放
+        self.res_scale = ResidualScale(C, init=1e-3)
 
     def forward(self, z: torch.Tensor, w_prior_branch: torch.Tensor = None) -> torch.Tensor:
         # z: [B,C,cyc,p]
-        f1, f2, f3 = self.b3(z), self.b5(z), self.bDil(z)
-        x = self.sk([f1, f2, f3], w_prior=w_prior_branch)   # [B,C,cyc,p]
+        x_in = self.pre(z)                                # Pre-Norm
+        f1, f2, f3 = self.b3(x_in), self.b5(x_in), self.bDil(x_in)
+        x = self.sk([f1, f2, f3], w_prior=w_prior_branch) # [B,C,cyc,p]
         x = self.merge_pw(x)
         x = self.merge_gn(x)
         x = self.act(x)
@@ -202,37 +235,58 @@ class Inception2dResBlock_SKSE(nn.Module):
         x = self.gn2(x)
         x = self.act(x)
 
-        x = self.se(x)                                      # 通道门控
-        return z + x                                        # 残差
+        if self.se_strength > 0:
+            # 将 SE 当成缓和因子：pow(se_strength)
+            x = x * (self.se(x).pow(self.se_strength))
+
+        return z + self.res_scale(x)                      # 缩放后的残差
 
 
 # =========================
-# 7) cyc 轴大核 Conv1d（深度可分离）
+# 7) cyc 轴大核 Conv1d（动态有效核长 + 3x堆叠近似 + 轻量门控 + 残差缩放）
 # =========================
 class CycLargeKernelConv1d(nn.Module):
     """
     在 [B,C,cyc,p] 的特征上，先对 p 轴做聚合得到 [B,C,cyc]，
-    然后沿 cyc 轴做深度可分离 1D 大核卷积，再广播回 2D。
+    然后沿 cyc 轴做深度可分离 1D 大核卷积（用多次3x卷积近似），再广播回 2D。
     """
     def __init__(self, channels: int, k: int = 15):
         super().__init__()
-        assert k % 2 == 1, "cyc kernel size must be odd"
         C = channels
-        self.dw = nn.Conv1d(C, C, kernel_size=k, padding=k // 2, groups=C, bias=False)
-        self.pw = nn.Conv1d(C, C, kernel_size=1, bias=False)
-        self.norm = nn.GroupNorm(num_groups=min(32, C), num_channels=C)
-        self.act = nn.GELU()
+        self.k_cfg = k
+        g = _best_gn_groups(C)
+        # 用 3x depthwise 近似大核，autotune 更稳
+        self.dw3 = nn.Conv1d(C, C, kernel_size=3, padding=1, groups=C, bias=False)
+        self.pw  = nn.Conv1d(C, C, kernel_size=1, bias=False)
+        self.norm = nn.GroupNorm(num_groups=g, num_channels=C)
+        self.act  = nn.GELU()
+        # 轻量门控，避免覆盖原特征
+        self.gate = nn.Sequential(nn.AdaptiveAvgPool1d(1), nn.Conv1d(C, C, 1, bias=False), nn.Sigmoid())
+        # 残差缩放
+        self.res_scale = ResidualScale(C, init=1e-3)
 
     def forward(self, z: torch.Tensor) -> torch.Tensor:
         # z: [B,C,cyc,p]
-        u = z.mean(dim=-1)                     # [B,C,cyc]
-        u = self.dw(u)
-        u = self.pw(u)
-        # GroupNorm 需要 [B,C,L] → 转为 [B,C,L] 的“通道在中间”已满足
-        u = self.norm(u)
-        u = self.act(u)
-        u = u.unsqueeze(-1).expand_as(z)       # [B,C,cyc,p]
-        return z + u                           # 残差融合
+        u = z.mean(dim=-1)                               # [B,C,cyc]
+        cyc = u.size(-1)
+        if cyc <= 1:
+            return z  # 边界保护
+
+        # 有效核长不超过 2*cyc-1，且不小于3
+        k_eff = max(3, min(self.k_cfg, 2 * cyc - 1))
+        rep = max(1, (k_eff // 3))
+
+        x = u
+        for _ in range(rep):
+            x = self.dw3(x)
+        x = self.pw(x)
+        x = self.norm(x)
+        x = self.act(x)
+
+        g = self.gate(u)                                 # [B,C,1]
+        x = x * g                                        # 轻量门控
+        x = x.unsqueeze(-1).expand_as(z)                 # [B,C,cyc,p]
+        return z + self.res_scale(x)                     # 缩放后的残差
 
 
 # =========================
@@ -246,10 +300,13 @@ class TimesBlock(nn.Module):
         self.d_model  = configs.d_model
         self.min_p    = getattr(configs, 'min_period', 3)
         self.drop2d   = getattr(configs, 'conv2d_dropout', 0.0)
-        self.cyc_k    = getattr(configs, 'cyc_conv_kernel', 15)  # 建议奇数：9/15/25
+        self.cyc_k    = getattr(configs, 'cyc_conv_kernel', 9)   # 起步用 9 更稳
+        self.sk_tau   = getattr(configs, 'sk_tau', 1.5)          # 初期更均匀
+        self.se_strength = getattr(configs, 'se_strength', 0.0)  # 先关/弱开
 
         self.decomp   = SeriesDecomp(self.kernel)
-        self.block2d  = Inception2dResBlock_SKSE(self.d_model, drop=self.drop2d)
+        self.block2d  = Inception2dResBlock_SKSE(self.d_model, drop=self.drop2d,
+                                                 sk_tau=self.sk_tau, se_strength=self.se_strength)
         self.cyc1d    = CycLargeKernelConv1d(self.d_model, k=self.cyc_k)
 
         # 内容感知门控（样本级标量，用于最终融合）
@@ -281,7 +338,7 @@ class TimesBlock(nn.Module):
         # 以 unique(p) 分桶
         unique_p = torch.unique(idx)
         for pv in unique_p.tolist():
-            mask = (idx == pv)                   # [B,k]
+            mask = (idx == pv)                          # [B,k]
             if not mask.any():
                 continue
             b_idx, j_idx = mask.nonzero(as_tuple=True)  # [m],[m]
@@ -293,10 +350,10 @@ class TimesBlock(nn.Module):
             # 折叠
             z, _T = _fold_2d_reflect(sb, int(pv))        # [m,C,cyc,p]
 
-            # 2D 多尺度 + SK + SE
+            # 2D 多尺度 + SK + SE（含 Pre-Norm/残差缩放）
             z = self.block2d(z)                          # [m,C,cyc,p]
 
-            # cyc 轴大核 Conv1d（跨周期长程）
+            # cyc 轴大核 Conv1d（跨周期长程，含残差缩放/门控/动态有效核长）
             z = self.cyc1d(z)                            # [m,C,cyc,p]
 
             # 展回 1D
@@ -341,20 +398,19 @@ class Model(nn.Module):
     def attention_pool(self, x: torch.Tensor) -> torch.Tensor:
         # x: [B,T,d] → [B,d]
         B, T, d = x.shape
-        q = self.pool_q.expand(B, -1, -1)                    # [B,1,d]
-        att = torch.matmul(q, x.transpose(1, 2)) / (d ** 0.5)  # [B,1,T]
+        q = self.pool_q.expand(B, -1, -1)                       # [B,1,d]
+        att = torch.matmul(q, x.transpose(1, 2)) / (d ** 0.5)   # [B,1,T]
         att = torch.softmax(att, dim=-1)
-        return torch.matmul(att, x).squeeze(1)               # [B,d]
+        return torch.matmul(att, x).squeeze(1)                  # [B,d]
 
     def forward(self, x_enc: torch.Tensor, *args) -> torch.Tensor:
-        x = self.project(x_enc)                               # [B,T,d]
+        x = self.project(x_enc)                                  # [B,T,d]
         for blk, ln in zip(self.blocks, self.norms):
-            x = ln(blk(x))                                    # [B,T,d]
-        x = self.attention_pool(x)                            # [B,d]
+            x = ln(blk(x))                                       # [B,T,d]
+        x = self.attention_pool(x)                               # [B,d]
         x = self.dropout(x)
-        out = self.classifier(x)                              # [B,num_class]
+        out = self.classifier(x)                                 # [B,num_class]
         return out
-
 
 
 # ------------------------------------------------------------
