@@ -902,6 +902,10 @@ class Dataset_Van(Dataset):
     - 将长序列按固定窗口 seq_len 非重叠切分
     - TRAIN / VAL / TEST = 70% / 15% / 15%
     - 返回: (x, y) 其中 x: [seq_len, feat_dim]，y: 标量类别ID (0/1/2)
+
+    变更点：
+    - 仅用【训练窗口】拟合 StandardScaler，再标准化全部数据（避免信息泄漏）；
+    - 保持与框架一致的属性：max_seq_len / feature_df / class_names。
     """
 
     def __init__(self, args, root_path, flag='TRAIN'):
@@ -940,7 +944,6 @@ class Dataset_Van(Dataset):
 
         # 对齐到共同最短长度与最小列数，避免越界/不一致
         arrays = [arr[:min_len, :min_feat] for arr in arrays]
-        self.data = np.stack(arrays, axis=0)  # (3, total_len, feat_dim) float32
         total_len, feat_dim = min_len, min_feat
 
         # 4) 计算非重叠窗口数
@@ -966,9 +969,21 @@ class Dataset_Van(Dataset):
                     else:
                         n_train = max(1, n_train - 1)
 
+        # ★ 6) 仅用【训练窗口】拟合 StandardScaler，然后标准化三个类别的全部数据
+        L_train = n_train * self.seq_len                         # 每个文件用于训练的时间步
+        assert L_train > 0, "L_train must be positive"
+        train_slices = [arr[:L_train] for arr in arrays]         # [(L_train, feat_dim)] * 3
+        train_concat = np.concatenate(train_slices, axis=0)      # (3*L_train, feat_dim)
+
+        self.scaler = StandardScaler()
+        self.scaler.fit(train_concat)
+
+        arrays = [self.scaler.transform(arr) for arr in arrays]  # 标准化全部时序
+        self.data = np.stack(arrays, axis=0)                     # (3, total_len, feat_dim) float32
+
         self.windows_per_file = n
 
-        # 6) 根据 flag 生成全局索引
+        # 7) 根据 flag 生成全局索引
         self.indices = []
         for f_idx in range(len(self.file_paths)):
             if self.flag == 'TRAIN':
@@ -980,7 +995,7 @@ class Dataset_Van(Dataset):
             for w in wins:
                 self.indices.append(f_idx * n + w)
 
-        # 7) 供 Exp_Classification 占位属性（与框架保持一致）
+        # 8) 供 Exp_Classification 占位属性（与框架保持一致）
         self.max_seq_len = self.seq_len
         self.feature_df  = pd.DataFrame(np.zeros((1, feat_dim), dtype=np.float32))
 
@@ -989,13 +1004,13 @@ class Dataset_Van(Dataset):
 
     def __getitem__(self, idx):
         g = self.indices[idx]
-        f_idx = g // self.windows_per_file   # 文件索引 (0/1/2)
-        w_idx = g %  self.windows_per_file   # 窗口索引
-        arr   = self.data[f_idx]             # (total_len, feat_dim) float32
+        f_idx = g // self.windows_per_file          # 文件索引 (0/1/2)
+        w_idx = g %  self.windows_per_file          # 窗口索引
+        arr   = self.data[f_idx]                    # (total_len, feat_dim) float32
         start = w_idx * self.seq_len
-        seg   = arr[start:start + self.seq_len]          # (seq_len, feat_dim) float32
-        seg   = np.ascontiguousarray(seg, dtype=np.float32)  # C 连续，避免 from_numpy 额外拷贝
-        x = torch.from_numpy(seg)                         # torch.float32
+        seg   = arr[start:start + self.seq_len]     # (seq_len, feat_dim) float32
+        seg   = np.ascontiguousarray(seg, dtype=np.float32)
+        x = torch.from_numpy(seg)                   # torch.float32
         y = torch.tensor(self.labels[f_idx], dtype=torch.long)
         return x, y
 
@@ -1014,20 +1029,15 @@ class Dataset_Van(Dataset):
         except Exception:
             df = pd.read_csv(path, header=0, engine='python', dtype=str)
 
-        # 删除时间戳列（一般叫 'ts'）
         if 'ts' in df.columns:
             df = df.drop(columns=['ts'])
 
-        # 去掉全空列 & 去空白
         df = df.dropna(axis=1, how='all').applymap(lambda x: x.strip() if isinstance(x, str) else x)
 
-        # 强制数值化
         for c in df.columns:
             df[c] = pd.to_numeric(df[c], errors='coerce')
 
-        # 缺失值处理
         df = df.fillna(method='ffill').fillna(method='bfill').fillna(0.0)
 
-        # 转为 float32 & C 连续
         arr = df.to_numpy(dtype=np.float32, copy=False)
         return np.ascontiguousarray(arr, dtype=np.float32)
