@@ -175,6 +175,18 @@ if __name__ == '__main__':
                         help="Discrimitive shapeDTW warp preset augmentation")
     parser.add_argument('--extra_tag', type=str, default="", help="Anything extra")
 
+    # ==== TimesNet-Adv 分类消融开关 ====
+    parser.add_argument('--use_series_decomp', type=int, default=1, help='1: enable SeriesDecomp (trend/seasonal)')
+    parser.add_argument('--use_sk', type=int, default=1, help='1: enable Selective Kernel in Inception2D')
+    parser.add_argument('--use_se', type=int, default=0, help='1: enable SE channel attention')
+    parser.add_argument('--se_strength', type=float, default=0.0, help='SE strength exponent (0 disables effect)')
+    parser.add_argument('--use_cyc_conv1d', type=int, default=1, help='1: enable large-kernel conv on cyc axis')
+    parser.add_argument('--cyc_conv_kernel', type=int, default=9, help='target effective kernel on cyc axis')
+    parser.add_argument('--use_gate_mlp', type=int, default=1, help='1: enable sample-wise gate for period fusion')
+    parser.add_argument('--use_res_scale', type=int, default=1, help='1: enable ResidualScale on residual branches')
+    parser.add_argument('--reflect_pad', type=int, default=1, help='1: use reflect padding in 1D->2D fold')
+    parser.add_argument('--sk_tau', type=float, default=1.5, help='temperature for SK softmax, >1=flatter')
+
     # TimeXer
     parser.add_argument('--patch_len', type=int, default=16, help='patch length')
 

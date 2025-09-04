@@ -1,0 +1,46 @@
+#!/usr/bin/env bash
+set -e
+
+BASE="python main.py --task_name classification --is_training 1 \
+  --root_path ./dataset/damage_detection_Vänersborg/ \
+  --model_id Van --model TimesNetAdv --data Van \
+  --e_layers 2 --batch_size 16 --d_model 16 --d_ff 32 --top_k 3 \
+  --learning_rate 0.001 --train_epochs 30 --patience 10 --num_workers 0 \
+  --gpu_type cpu"
+
+# 基线
+$BASE --use_series_decomp 1 --use_sk 1 --use_se 0 --se_strength 0.0 \
+      --use_cyc_conv1d 1 --cyc_conv_kernel 9 --use_gate_mlp 1 \
+      --use_res_scale 1 --reflect_pad 1 --sk_tau 1.5 \
+      --des "TimesNetAdv_base"
+
+# 单因素关闭
+$BASE --use_series_decomp 0 --use_sk 1 --use_se 0 --se_strength 0.0 \
+      --use_cyc_conv1d 1 --cyc_conv_kernel 9 --use_gate_mlp 1 \
+      --use_res_scale 1 --reflect_pad 1 --sk_tau 1.5 \
+      --des "TimesNetAdv_SeriesDecompOff"
+
+$BASE --use_series_decomp 1 --use_sk 0 --use_se 0 --se_strength 0.0 \
+      --use_cyc_conv1d 1 --cyc_conv_kernel 9 --use_gate_mlp 1 \
+      --use_res_scale 1 --reflect_pad 1 --sk_tau 1.5 \
+      --des "TimesNetAdv_SKOff"
+
+$BASE --use_series_decomp 1 --use_sk 1 --use_se 0 --se_strength 0.0 \
+      --use_cyc_conv1d 0 --use_gate_mlp 1 \
+      --use_res_scale 1 --reflect_pad 1 --sk_tau 1.5 \
+      --des "TimesNetAdv_CycConvOff"
+
+$BASE --use_series_decomp 1 --use_sk 1 --use_se 0 --se_strength 0.0 \
+      --use_cyc_conv1d 1 --cyc_conv_kernel 9 --use_gate_mlp 0 \
+      --use_res_scale 1 --reflect_pad 1 --sk_tau 1.5 \
+      --des "TimesNetAdv_GateOff"
+
+$BASE --use_series_decomp 1 --use_sk 1 --use_se 0 --se_strength 0.0 \
+      --use_cyc_conv1d 1 --cyc_conv_kernel 9 --use_gate_mlp 1 \
+      --use_res_scale 0 --reflect_pad 1 --sk_tau 1.5 \
+      --des "TimesNetAdv_ResScaleOff"
+
+$BASE --use_series_decomp 1 --use_sk 1 --use_se 0 --se_strength 0.0 \
+      --use_cyc_conv1d 1 --cyc_conv_kernel 9 --use_gate_mlp 1 \
+      --use_res_scale 1 --reflect_pad 0 --sk_tau 1.5 \
+      --des "TimesNetAdv_ReflectOff"
