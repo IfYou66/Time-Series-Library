@@ -48,11 +48,26 @@ def data_provider(args, flag):
         return data_set, data_loader
     elif args.task_name == 'classification':
         drop_last = False
-        data_set = Data(
-            args = args,
-            root_path=args.root_path,
-            flag=flag,
-        )
+
+        if args.data == 'UEA':
+            # ---- 保持原始 UEAloader 的调用 ----
+            data_set = Data(
+                args=args,
+                root_path=args.root_path,
+                flag=flag
+            )
+        else:
+            # ---- 你的自定义数据集（Van/Hell等CSV） ----
+            data_set = Data(
+                args=args,
+                root_path=args.root_path,
+                flag=flag,
+            )
+        # data_set = Data(
+        #     args = args,
+        #     root_path=args.root_path,
+        #     flag=flag,
+        # )
 
         data_loader = DataLoader(
             data_set,
