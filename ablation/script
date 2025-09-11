@@ -1,46 +1,20 @@
-#!/usr/bin/env bash
-set -e
+基线（建议对照组）
+--task_name classification --is_training 1 --root_path ./dataset/damage_detection_hell/
+--model_id Hell --model TimesNetAdv --data Hell --e_layers 2 --batch_size 16 --d_model 16 --d_ff 32 --top_k 3 --itr 1 --learning_rate 0.001 --train_epochs 30 --patience 10 --num_workers 0  --use_series_decomp 1 --use_sk 1 --use_se 0 --se_strength 0.0 --use_cyc_conv1d 1 --cyc_conv_kernel 9 --use_gate_mlp 1 --use_res_scale 1 --reflect_pad 1 --sk_tau 1.5 --des TimesNetAdv_base
 
-BASE="python main.py --task_name classification --is_training 1 \
-  --root_path ./dataset/damage_detection_Vänersborg/ \
-  --model_id Van --model TimesNetAdv --data Van \
-  --e_layers 2 --batch_size 16 --d_model 16 --d_ff 32 --top_k 3 \
-  --learning_rate 0.001 --train_epochs 30 --patience 10 --num_workers 0 \
-  --gpu_type cpu"
+关闭趋势/季节分离
+--task_name classification --is_training 1 --root_path ./dataset/damage_detection_hell/
+--model_id Hell --model TimesNetAdv --data Hell --e_layers 2 --batch_size 16 --d_model 16 --d_ff 32 --top_k 3 --itr 1 --learning_rate 0.001 --train_epochs 30 --patience 10 --num_workers 0  --use_series_decomp 0 --use_sk 1 --use_se 0 --se_strength 0.0 --use_cyc_conv1d 1 --cyc_conv_kernel 9 --use_gate_mlp 1 --use_res_scale 1 --reflect_pad 1 --sk_tau 1.5 --des TimesNetAdv_ablate_SeriesDecomp
 
-# 基线
-$BASE --use_series_decomp 1 --use_sk 1 --use_se 0 --se_strength 0.0 \
-      --use_cyc_conv1d 1 --cyc_conv_kernel 9 --use_gate_mlp 1 \
-      --use_res_scale 1 --reflect_pad 1 --sk_tau 1.5 \
-      --des "TimesNetAdv_base"
+去掉 SK+SE
+--task_name classification --is_training 1 --root_path ./dataset/damage_detection_hell/
+--model_id Hell --model TimesNetAdv --data Hell --e_layers 2 --batch_size 16 --d_model 16 --d_ff 32 --top_k 3 --itr 1 --learning_rate 0.001 --train_epochs 30 --patience 10 --num_workers 0  --use_series_decomp 1 --use_sk 0 --use_se 0 --se_strength 0.0 --use_cyc_conv1d 1 --cyc_conv_kernel 9 --use_gate_mlp 1 --use_res_scale 1 --reflect_pad 1 --sk_tau 1.5 --des TimesNetAdv_ablate_SK_SE
 
-# 单因素关闭
-$BASE --use_series_decomp 0 --use_sk 1 --use_se 0 --se_strength 0.0 \
-      --use_cyc_conv1d 1 --cyc_conv_kernel 9 --use_gate_mlp 1 \
-      --use_res_scale 1 --reflect_pad 1 --sk_tau 1.5 \
-      --des "TimesNetAdv_SeriesDecompOff"
+CycLargeKernelConv1d → 周期维长程依赖（关闭以做消融）
+--task_name classification --is_training 1 --root_path ./dataset/damage_detection_hell/ --model_id Hell --model TimesNetAdv --data Hell --e_layers 2 --batch_size 16 --d_model 16 --d_ff 32 --top_k 3 --itr 1 --learning_rate 0.001 --train_epochs 30 --patience 10 --num_workers 0 --use_series_decomp 1 --use_sk 1 --use_se 0 --se_strength 0.0 --use_cyc_conv1d 0 --use_gate_mlp 1 --use_res_scale 1 --reflect_pad 1 --sk_tau 1.5 --des TimesNetAdv_ablate_CycConv
 
-$BASE --use_series_decomp 1 --use_sk 0 --use_se 0 --se_strength 0.0 \
-      --use_cyc_conv1d 1 --cyc_conv_kernel 9 --use_gate_mlp 1 \
-      --use_res_scale 1 --reflect_pad 1 --sk_tau 1.5 \
-      --des "TimesNetAdv_SKOff"
+内容感知门控 (gate_mlp)（关闭以做消融）
+--task_name classification --is_training 1 --root_path ./dataset/damage_detection_hell/ --model_id Hell --model TimesNetAdv --data Hell --e_layers 2 --batch_size 16 --d_model 16 --d_ff 32 --top_k 3 --itr 1 --learning_rate 0.001 --train_epochs 30 --patience 10 --num_workers 0 --use_series_decomp 1 --use_sk 1 --use_se 0 --se_strength 0.0 --use_cyc_conv1d 1 --cyc_conv_kernel 9 --use_gate_mlp 0 --use_res_scale 1 --reflect_pad 1 --sk_tau 1.5 --des TimesNetAdv_ablate_GateMLP
 
-$BASE --use_series_decomp 1 --use_sk 1 --use_se 0 --se_strength 0.0 \
-      --use_cyc_conv1d 0 --use_gate_mlp 1 \
-      --use_res_scale 1 --reflect_pad 1 --sk_tau 1.5 \
-      --des "TimesNetAdv_CycConvOff"
-
-$BASE --use_series_decomp 1 --use_sk 1 --use_se 0 --se_strength 0.0 \
-      --use_cyc_conv1d 1 --cyc_conv_kernel 9 --use_gate_mlp 0 \
-      --use_res_scale 1 --reflect_pad 1 --sk_tau 1.5 \
-      --des "TimesNetAdv_GateOff"
-
-$BASE --use_series_decomp 1 --use_sk 1 --use_se 0 --se_strength 0.0 \
-      --use_cyc_conv1d 1 --cyc_conv_kernel 9 --use_gate_mlp 1 \
-      --use_res_scale 0 --reflect_pad 1 --sk_tau 1.5 \
-      --des "TimesNetAdv_ResScaleOff"
-
-$BASE --use_series_decomp 1 --use_sk 1 --use_se 0 --se_strength 0.0 \
-      --use_cyc_conv1d 1 --cyc_conv_kernel 9 --use_gate_mlp 1 \
-      --use_res_scale 1 --reflect_pad 0 --sk_tau 1.5 \
-      --des "TimesNetAdv_ReflectOff"
+残差缩放 (ResidualScale) + 反射填充（同时关闭以做消融）
+--task_name classification --is_training 1 --root_path ./dataset/damage_detection_hell/ --model_id Hell --model TimesNetAdv --data Hell --e_layers 2 --batch_size 16 --d_model 16 --d_ff 32 --top_k 3 --itr 1 --learning_rate 0.001 --train_epochs 30 --patience 10 --num_workers 0 --use_series_decomp 1 --use_sk 1 --use_se 0 --se_strength 0.0 --use_cyc_conv1d 1 --cyc_conv_kernel 9 --use_gate_mlp 1 --use_res_scale 0 --reflect_pad 0 --sk_tau 1.5 --des TimesNetAdv_ablate_ResScale_Reflect
