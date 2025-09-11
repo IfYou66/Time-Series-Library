@@ -897,11 +897,13 @@ class Dataset_Hell(Dataset):
 
 class Dataset_Van(Dataset):
     """
-    三分类数据集加载器（type00/01/02）
-    - 每个 CSV 对应一个类别（0/1/2）
-    - 将长序列按固定窗口 seq_len 非重叠切分
-    - TRAIN / VAL / TEST = 70% / 15% / 15%
-    - 返回: (x, y) 其中 x: [seq_len, feat_dim]，y: 标量类别ID (0/1/2)
+    Van（3类）桥梁时序分类数据集加载器
+    - 根目录下需存在: type00.csv, type01.csv, type02.csv
+    - 自动去掉 'ts' 列，只保留数值特征
+    - 每个 CSV 按 seq_len 划分非重叠窗口
+    - 70%/15%/15% 时间切分 -> TRAIN/VAL/TEST
+    - 仅 TRAIN 阶段做轻量增强（jitter + scaling + 微小 time-warp）
+    - 返回 (x, y)，x: [seq_len, feat_dim]，y: long (0/1/2)
     """
 
     def __init__(self, args, root_path, flag='TRAIN'):
@@ -909,125 +911,256 @@ class Dataset_Van(Dataset):
         self.args = args
         self.root = root_path
         self.flag = str(flag).upper()
-        assert self.flag in ('TRAIN', 'VAL', 'TEST'), f"flag must be TRAIN/VAL/TEST, got {flag}"
+        assert self.flag in ('TRAIN', 'VAL', 'TEST')
 
-        # 1) 匹配三个 CSV 文件
-        pattern = os.path.join(self.root, 'type*.csv')
-        self.file_paths = sorted(glob.glob(pattern))
-        assert len(self.file_paths) == 3, f"Expected 3 CSVs, found {len(self.file_paths)} at {pattern}"
+        # ---- 找文件并贴标签 ----
+        all_files = glob.glob(os.path.join(self.root, '*.csv'))
+        wanted = {'type00': 0, 'type01': 1, 'type02': 2}
+        pairs = []
+        for p in sorted(all_files):
+            base = os.path.basename(p).lower()
+            for k, v in wanted.items():
+                if k in base:
+                    pairs.append((p, v))
+                    break
+        assert len(pairs) == 3, f"Expect 3 CSV(type00/01/02), found {len(pairs)}: {pairs}"
+        self.file_label_pairs = pairs
+        self.class_names = ['type00', 'type01', 'type02']
 
-        # 2) 生成标签：type00->0, type01->1, type02->2
-        self.labels = []
-        self.class_names = []
-        for p in self.file_paths:
-            fn = os.path.basename(p).lower()
-            m = re.search(r'type(\d{2})', fn)
-            assert m, f"Bad filename (expect type00/01/02*): {fn}"
-            lbl = int(m.group(1))
-            assert lbl in (0, 1, 2), f"Label must be 00/01/02, got {lbl:02d} from {fn}"
-            self.labels.append(lbl)
-            self.class_names.append(fn)
+        # ---- 读首个文件拿维度 ----
+        df0 = pd.read_csv(self.file_label_pairs[0][0])
+        if 'ts' in df0.columns:
+            df0 = df0.drop(columns=['ts'])
+        total_len, feat_dim = df0.shape
 
-        # 3) 读取所有文件为 float32，并对齐长度与列数（鲁棒）
-        arrays = []
-        min_len, min_feat = None, None
-        for p in self.file_paths:
-            arr = self._read_csv_numeric_array(p)  # float32, 无缺失, C 连续
-            arrays.append(arr)
-            L, C = arr.shape
-            min_len = L if min_len is None else min(min_len, L)
-            min_feat = C if min_feat is None else min(min_feat, C)
-
-        # 对齐到共同最短长度与最小列数，避免越界/不一致
-        arrays = [arr[:min_len, :min_feat] for arr in arrays]
-        self.data = np.stack(arrays, axis=0)  # (3, total_len, feat_dim) float32
-        total_len, feat_dim = min_len, min_feat
-
-        # 4) 计算非重叠窗口数
         self.seq_len = int(self.args.seq_len)
-        assert self.seq_len > 0, "seq_len must be positive"
-        n = total_len // self.seq_len
-        assert n > 0, f"seq_len({self.seq_len}) 太大，单文件无法切出任何窗口（total_len={total_len}）"
+        n_win = total_len // self.seq_len
+        assert n_win > 0, "seq_len 太大，无法切出窗口"
+        self.windows_per_file = n_win
 
-        # 5) 按窗口数划分 TRAIN/VAL/TEST 比例（四舍五入并确保和为 n）
-        train_r, val_r, test_r = 0.7, 0.15, 0.15
-        n_train = max(1, round(n * train_r))
-        n_val   = max(1, round(n * val_r))
-        n_test  = n - n_train - n_val
+        # ---- 按 70/15/15 窗口数划分 ----
+        n_train = max(1, round(n_win * 0.7))
+        n_val   = max(1, round(n_win * 0.15))
+        n_test  = n_win - n_train - n_val
         if n_test < 1:
             n_test = 1
-            if n_train + n_val + n_test > n:
-                overflow = n_train + n_val + n_test - n
-                for _ in range(overflow):
-                    if n_test > 1:
-                        n_test -= 1
-                    elif n_val > 1:
-                        n_val -= 1
-                    else:
-                        n_train = max(1, n_train - 1)
+            while n_train + n_val + n_test > n_win:
+                if n_val > 1: n_val -= 1
+                elif n_train > 1: n_train -= 1
+                else: break
 
-        self.windows_per_file = n
+        # ---- 读入全部文件数据 ----
+        data, labels = [], []
+        for p, lbl in self.file_label_pairs:
+            df = pd.read_csv(p)
+            if 'ts' in df.columns:
+                df = df.drop(columns=['ts'])
+            arr = df.values.astype(np.float32)
+            arr = np.nan_to_num(arr)
+            data.append(arr)
+            labels.append(lbl)
+        self.data = np.stack(data, axis=0)       # (3, total_len, feat_dim)
+        self.labels = np.array(labels, dtype=np.int64)
 
-        # 6) 根据 flag 生成全局索引
-        self.indices = []
-        for f_idx in range(len(self.file_paths)):
-            if self.flag == 'TRAIN':
-                wins = range(0, n_train)
-            elif self.flag == 'VAL':
-                wins = range(n_train, n_train + n_val)
-            else:  # TEST
-                wins = range(n_train + n_val, n)
-            for w in wins:
-                self.indices.append(f_idx * n + w)
+        # ---- 索引表 ----
+        if self.flag == 'TRAIN':
+            w_range = range(0, n_train)
+        elif self.flag == 'VAL':
+            w_range = range(n_train, n_train + n_val)
+        else:
+            w_range = range(n_train + n_val, n_win)
 
-        # 7) 供 Exp_Classification 占位属性（与框架保持一致）
+        self.indices = [f_idx * n_win + w for f_idx in range(3) for w in w_range]
+
+        # 保持与 Hell/UEA 接口一致
         self.max_seq_len = self.seq_len
         self.feature_df  = pd.DataFrame(np.zeros((1, feat_dim), dtype=np.float32))
+
+    @staticmethod
+    def _instance_norm(x: torch.Tensor) -> torch.Tensor:
+        """逐样本实例归一化"""
+        mean = x.mean(0, keepdim=True)
+        var  = torch.var(x, dim=0, keepdim=True, unbiased=False)
+        return (x - mean) / torch.sqrt(var + 1e-5)
+
+    @staticmethod
+    def _augment(x_np: np.ndarray) -> np.ndarray:
+        """轻量增强: jitter + scaling + 微小 time-warp"""
+        L, C = x_np.shape
+        x = x_np.copy()
+
+        # 1) jitter
+        col_std = x.std(axis=0, keepdims=True) + 1e-6
+        noise = np.random.normal(0.0, 0.01, size=x.shape).astype(np.float32)
+        x += noise * col_std
+
+        # 2) scaling
+        scales = np.random.normal(1.0, 0.1, size=(1, C)).astype(np.float32)
+        x *= scales
+
+        # 3) time-warp (整体拉伸/压缩 0.95~1.05)
+        alpha = float(np.random.uniform(0.95, 1.05))
+        t_src = np.linspace(0, 1, num=L, dtype=np.float32)
+        t_tgt = np.linspace(0, 1, num=L, dtype=np.float32) ** (1.0 / alpha)
+        for c in range(C):
+            x[:, c] = np.interp(t_src, t_tgt, x[:, c])
+
+        return x
 
     def __len__(self):
         return len(self.indices)
 
     def __getitem__(self, idx):
         g = self.indices[idx]
-        f_idx = g // self.windows_per_file   # 文件索引 (0/1/2)
-        w_idx = g %  self.windows_per_file   # 窗口索引
-        arr   = self.data[f_idx]             # (total_len, feat_dim) float32
+        f_idx = g // self.windows_per_file
+        w_idx = g %  self.windows_per_file
+
+        arr   = self.data[f_idx]                  # (total_len, C)
         start = w_idx * self.seq_len
-        seg   = arr[start:start + self.seq_len]          # (seq_len, feat_dim) float32
-        seg   = np.ascontiguousarray(seg, dtype=np.float32)  # C 连续，避免 from_numpy 额外拷贝
-        x = torch.from_numpy(seg)                         # torch.float32
+        seg   = arr[start:start + self.seq_len]   # (L, C)
+
+        if self.flag == 'TRAIN' and np.random.rand() < 0.5:
+            seg = self._augment(seg)
+
+        x = torch.from_numpy(seg).float()
+        x = self._instance_norm(x)
         y = torch.tensor(self.labels[f_idx], dtype=torch.long)
         return x, y
 
-    @staticmethod
-    def _read_csv_numeric_array(path):
-        """
-        鲁棒读取 CSV 为 float32 的 numpy 数组：
-        - 以 header=0 读取（首行为列名）
-        - 丢掉时间戳列(ts)，保留数值列
-        - to_numeric 强制数值化，非法值置 NaN
-        - 缺失填充：ffill -> bfill -> 0
-        - 返回 C 连续 float32
-        """
-        try:
-            df = pd.read_csv(path, header=0, engine='c', dtype=str)
-        except Exception:
-            df = pd.read_csv(path, header=0, engine='python', dtype=str)
 
-        # 删除时间戳列（一般叫 'ts'）
-        if 'ts' in df.columns:
-            df = df.drop(columns=['ts'])
-
-        # 去掉全空列 & 去空白
-        df = df.dropna(axis=1, how='all').applymap(lambda x: x.strip() if isinstance(x, str) else x)
-
-        # 强制数值化
-        for c in df.columns:
-            df[c] = pd.to_numeric(df[c], errors='coerce')
-
-        # 缺失值处理
-        df = df.fillna(method='ffill').fillna(method='bfill').fillna(0.0)
-
-        # 转为 float32 & C 连续
-        arr = df.to_numpy(dtype=np.float32, copy=False)
-        return np.ascontiguousarray(arr, dtype=np.float32)
+# class Dataset_Van(Dataset):
+#     """
+#     三分类数据集加载器（type00/01/02）
+#     - 每个 CSV 对应一个类别（0/1/2）
+#     - 将长序列按固定窗口 seq_len 非重叠切分
+#     - TRAIN / VAL / TEST = 70% / 15% / 15%
+#     - 返回: (x, y) 其中 x: [seq_len, feat_dim]，y: 标量类别ID (0/1/2)
+#     """
+#
+#     def __init__(self, args, root_path, flag='TRAIN'):
+#         super().__init__()
+#         self.args = args
+#         self.root = root_path
+#         self.flag = str(flag).upper()
+#         assert self.flag in ('TRAIN', 'VAL', 'TEST'), f"flag must be TRAIN/VAL/TEST, got {flag}"
+#
+#         # 1) 匹配三个 CSV 文件
+#         pattern = os.path.join(self.root, 'type*.csv')
+#         self.file_paths = sorted(glob.glob(pattern))
+#         assert len(self.file_paths) == 3, f"Expected 3 CSVs, found {len(self.file_paths)} at {pattern}"
+#
+#         # 2) 生成标签：type00->0, type01->1, type02->2
+#         self.labels = []
+#         self.class_names = []
+#         for p in self.file_paths:
+#             fn = os.path.basename(p).lower()
+#             m = re.search(r'type(\d{2})', fn)
+#             assert m, f"Bad filename (expect type00/01/02*): {fn}"
+#             lbl = int(m.group(1))
+#             assert lbl in (0, 1, 2), f"Label must be 00/01/02, got {lbl:02d} from {fn}"
+#             self.labels.append(lbl)
+#             self.class_names.append(fn)
+#
+#         # 3) 读取所有文件为 float32，并对齐长度与列数（鲁棒）
+#         arrays = []
+#         min_len, min_feat = None, None
+#         for p in self.file_paths:
+#             arr = self._read_csv_numeric_array(p)  # float32, 无缺失, C 连续
+#             arrays.append(arr)
+#             L, C = arr.shape
+#             min_len = L if min_len is None else min(min_len, L)
+#             min_feat = C if min_feat is None else min(min_feat, C)
+#
+#         # 对齐到共同最短长度与最小列数，避免越界/不一致
+#         arrays = [arr[:min_len, :min_feat] for arr in arrays]
+#         self.data = np.stack(arrays, axis=0)  # (3, total_len, feat_dim) float32
+#         total_len, feat_dim = min_len, min_feat
+#
+#         # 4) 计算非重叠窗口数
+#         self.seq_len = int(self.args.seq_len)
+#         assert self.seq_len > 0, "seq_len must be positive"
+#         n = total_len // self.seq_len
+#         assert n > 0, f"seq_len({self.seq_len}) 太大，单文件无法切出任何窗口（total_len={total_len}）"
+#
+#         # 5) 按窗口数划分 TRAIN/VAL/TEST 比例（四舍五入并确保和为 n）
+#         train_r, val_r, test_r = 0.7, 0.15, 0.15
+#         n_train = max(1, round(n * train_r))
+#         n_val   = max(1, round(n * val_r))
+#         n_test  = n - n_train - n_val
+#         if n_test < 1:
+#             n_test = 1
+#             if n_train + n_val + n_test > n:
+#                 overflow = n_train + n_val + n_test - n
+#                 for _ in range(overflow):
+#                     if n_test > 1:
+#                         n_test -= 1
+#                     elif n_val > 1:
+#                         n_val -= 1
+#                     else:
+#                         n_train = max(1, n_train - 1)
+#
+#         self.windows_per_file = n
+#
+#         # 6) 根据 flag 生成全局索引
+#         self.indices = []
+#         for f_idx in range(len(self.file_paths)):
+#             if self.flag == 'TRAIN':
+#                 wins = range(0, n_train)
+#             elif self.flag == 'VAL':
+#                 wins = range(n_train, n_train + n_val)
+#             else:  # TEST
+#                 wins = range(n_train + n_val, n)
+#             for w in wins:
+#                 self.indices.append(f_idx * n + w)
+#
+#         # 7) 供 Exp_Classification 占位属性（与框架保持一致）
+#         self.max_seq_len = self.seq_len
+#         self.feature_df  = pd.DataFrame(np.zeros((1, feat_dim), dtype=np.float32))
+#
+#     def __len__(self):
+#         return len(self.indices)
+#
+#     def __getitem__(self, idx):
+#         g = self.indices[idx]
+#         f_idx = g // self.windows_per_file   # 文件索引 (0/1/2)
+#         w_idx = g %  self.windows_per_file   # 窗口索引
+#         arr   = self.data[f_idx]             # (total_len, feat_dim) float32
+#         start = w_idx * self.seq_len
+#         seg   = arr[start:start + self.seq_len]          # (seq_len, feat_dim) float32
+#         seg   = np.ascontiguousarray(seg, dtype=np.float32)  # C 连续，避免 from_numpy 额外拷贝
+#         x = torch.from_numpy(seg)                         # torch.float32
+#         y = torch.tensor(self.labels[f_idx], dtype=torch.long)
+#         return x, y
+#
+#     @staticmethod
+#     def _read_csv_numeric_array(path):
+#         """
+#         鲁棒读取 CSV 为 float32 的 numpy 数组：
+#         - 以 header=0 读取（首行为列名）
+#         - 丢掉时间戳列(ts)，保留数值列
+#         - to_numeric 强制数值化，非法值置 NaN
+#         - 缺失填充：ffill -> bfill -> 0
+#         - 返回 C 连续 float32
+#         """
+#         try:
+#             df = pd.read_csv(path, header=0, engine='c', dtype=str)
+#         except Exception:
+#             df = pd.read_csv(path, header=0, engine='python', dtype=str)
+#
+#         # 删除时间戳列（一般叫 'ts'）
+#         if 'ts' in df.columns:
+#             df = df.drop(columns=['ts'])
+#
+#         # 去掉全空列 & 去空白
+#         df = df.dropna(axis=1, how='all').applymap(lambda x: x.strip() if isinstance(x, str) else x)
+#
+#         # 强制数值化
+#         for c in df.columns:
+#             df[c] = pd.to_numeric(df[c], errors='coerce')
+#
+#         # 缺失值处理
+#         df = df.fillna(method='ffill').fillna(method='bfill').fillna(0.0)
+#
+#         # 转为 float32 & C 连续
+#         arr = df.to_numpy(dtype=np.float32, copy=False)
+#         return np.ascontiguousarray(arr, dtype=np.float32)
