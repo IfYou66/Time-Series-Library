@@ -953,21 +953,128 @@ class UEAloader(Dataset):
         return len(self.all_IDs)
 
 
+# 没有标准化的Hell
+# class Dataset_Hell(Dataset):
+#     """
+#     Hell Bridge Test Arena 多分类数据集加载器
+#     每个 CSV 对应一个状态（10 类），
+#     将每条长时序按固定窗口 seq_len 划分，并在 TRAIN/VAL/TEST 三种模式下完成 70%/15%/15% 划分。
+#     """
+#
+#     def __init__(self, args, root_path, flag='TRAIN'):
+#         super().__init__()
+#         self.args = args
+#         self.root = root_path
+#         self.flag = flag.upper()
+#         assert self.flag in ('TRAIN','VAL','TEST'), f"flag must be TRAIN/VAL/TEST, got {flag}"
+#
+#         # 1) 找到所有 CSV
+#         pattern = os.path.join(self.root, 'MVS_P2_*.csv')
+#         self.file_paths = sorted(glob.glob(pattern))
+#         assert len(self.file_paths)==10, f"Expected 10 CSVs, found {len(self.file_paths)}"
+#
+#         # 2) 生成每个文件的标签
+#         self.labels = []
+#         self.class_names = []
+#         for p in self.file_paths:
+#             fn = os.path.basename(p)
+#             if 'UDS_NM_Z_01' in fn:    lbl=0
+#             elif 'UDS_NM_Z_02' in fn:  lbl=1
+#             else:
+#                 m=re.search(r'DS([1-8])',fn)
+#                 assert m, f"Bad filename {fn}"
+#                 lbl=int(m.group(1))+1
+#             self.labels.append(lbl)
+#             self.class_names.append(fn)
+#
+#         # 3) 读首个文件拿总长度 & 特征维
+#         df0 = pd.read_csv(self.file_paths[0],header=None)
+#         total_len, feat_dim = df0.shape
+#
+#         # 4) 计算非重叠窗口数
+#         self.seq_len = args.seq_len
+#         n = total_len // self.seq_len
+#         assert n>0, "seq_len太大，得不到任何窗口"
+#
+#         # 5) 按比例划分：round 避免全部向下取整
+#         train_r, val_r, test_r = 0.7, 0.15, 0.15
+#         n_train = max(1, round(n*train_r))
+#         n_val   = max(1, round(n*val_r))
+#         # 剩余给 test
+#         n_test  = n - n_train - n_val
+#         # 若出现负数（四舍五入导致），再调整
+#         if n_test<1:
+#             n_test=1
+#             # 重新保证总和
+#             if n_train + n_val + n_test > n:
+#                 # 优先保证 train，再 val，再 test
+#                 overflow = n_train+n_val+n_test - n
+#                 for _ in range(overflow):
+#                     if n_test>1: n_test-=1
+#                     elif n_val>1: n_val-=1
+#                     else: n_train = max(1,n_train-1)
+#
+#         # 6) 读入所有数据
+#         self.data = []
+#         for p in self.file_paths:
+#             df = pd.read_csv(p,header=None)
+#             self.data.append(df.values)
+#         self.data = np.stack(self.data,axis=0)  # (10, total_len, feat_dim)
+#         self.windows_per_file = n
+#
+#         # 7) 构造本 flag 下的全局 idx 列表
+#         self.indices = []
+#         for f_idx in range(len(self.file_paths)):
+#             if self.flag=='TRAIN':
+#                 wins = range(0, n_train)
+#             elif self.flag=='VAL':
+#                 wins = range(n_train, n_train+n_val)
+#             else:  # TEST
+#                 wins = range(n_train+n_val, n)
+#             for w in wins:
+#                 self.indices.append(f_idx*n + w)
+#
+#         # 8) 供 Exp_Classification 读取用
+#         self.max_seq_len = self.seq_len
+#         self.feature_df  = pd.DataFrame(np.zeros((1, feat_dim)))
+#
+#     def __len__(self):
+#         return len(self.indices)
+#
+#     def __getitem__(self, idx):
+#         g = self.indices[idx]
+#         f_idx = g // self.windows_per_file
+#         w_idx = g %  self.windows_per_file
+#         arr   = self.data[f_idx]  # (total_len,feat_dim)
+#         start = w_idx * self.seq_len
+#         seg   = arr[start:start+self.seq_len]
+#         x = torch.from_numpy(seg).float()
+#         y = torch.tensor(self.labels[f_idx],dtype=torch.long)
+#         return x, y
+
 class Dataset_Hell(Dataset):
     """
     Hell Bridge Test Arena 多分类数据集加载器
     每个 CSV 对应一个状态（10 类），
     将每条长时序按固定窗口 seq_len 划分，并在 TRAIN/VAL/TEST 三种模式下完成 70%/15%/15% 划分。
+    加入“鲁棒性开关”：实例归一化 / 一阶差分 / gap，默认关闭，便于做消融与统一协议。
     """
+
+    # ======== 鲁棒性开关（默认关闭以保持与你当前基线一致）========
+    APPLY_INSTANCE_NORM = False   # True: 每个文件内按通道去均值/除方差
+    APPLY_DIFF          = False   # True: 一阶差分（首帧补0），弱化趋势与慢变偏置
+    VAL_TEST_GAP        = 0.00    # 例如 0.05 表示在 train 与 val/test 间空出 5% 窗口
+    EPS                 = 1e-5
+    # ==========================================================
 
     def __init__(self, args, root_path, flag='TRAIN'):
         super().__init__()
         self.args = args
         self.root = root_path
-        self.flag = flag.upper()
+        self.flag = str(flag).upper()
         assert self.flag in ('TRAIN','VAL','TEST'), f"flag must be TRAIN/VAL/TEST, got {flag}"
 
-        # 1) 找到所有 CSV
+        # 1) 找到所有 CSV（10 类）
         pattern = os.path.join(self.root, 'MVS_P2_*.csv')
         self.file_paths = sorted(glob.glob(pattern))
         assert len(self.file_paths)==10, f"Expected 10 CSVs, found {len(self.file_paths)}"
@@ -987,53 +1094,72 @@ class Dataset_Hell(Dataset):
             self.class_names.append(fn)
 
         # 3) 读首个文件拿总长度 & 特征维
-        df0 = pd.read_csv(self.file_paths[0],header=None)
+        df0 = pd.read_csv(self.file_paths[0], header=None)
         total_len, feat_dim = df0.shape
 
-        # 4) 计算非重叠窗口数
+        # 4) 非重叠窗口数
         self.seq_len = args.seq_len
-        n = total_len // self.seq_len
-        assert n>0, "seq_len太大，得不到任何窗口"
+        n_all = total_len // self.seq_len
+        assert n_all>0, "seq_len太大，得不到任何窗口"
+        self.windows_per_file = n_all  # 每文件窗口数相同
 
-        # 5) 按比例划分：round 避免全部向下取整
-        train_r, val_r, test_r = 0.7, 0.15, 0.15
-        n_train = max(1, round(n*train_r))
-        n_val   = max(1, round(n*val_r))
-        # 剩余给 test
-        n_test  = n - n_train - n_val
-        # 若出现负数（四舍五入导致），再调整
-        if n_test<1:
-            n_test=1
-            # 重新保证总和
-            if n_train + n_val + n_test > n:
-                # 优先保证 train，再 val，再 test
-                overflow = n_train+n_val+n_test - n
-                for _ in range(overflow):
-                    if n_test>1: n_test-=1
-                    elif n_val>1: n_val-=1
-                    else: n_train = max(1,n_train-1)
-
-        # 6) 读入所有数据
-        self.data = []
+        # 5) 读取所有数据（可选预处理）
+        #    self.data 形状：(num_files, total_len, feat_dim)
+        mats = []
         for p in self.file_paths:
-            df = pd.read_csv(p,header=None)
-            self.data.append(df.values)
-        self.data = np.stack(self.data,axis=0)  # (10, total_len, feat_dim)
-        self.windows_per_file = n
+            df = pd.read_csv(p, header=None)
+            x  = df.values.astype(np.float32)  # [T, C]
 
-        # 7) 构造本 flag 下的全局 idx 列表
+            # —— 实例归一化（文件内）——
+            if self.APPLY_INSTANCE_NORM:
+                mean = x.mean(axis=0, keepdims=True)
+                std  = x.std(axis=0, keepdims=True)
+                x    = (x - mean) / (std + self.EPS)
+
+            # —— 一阶差分 ——
+            if self.APPLY_DIFF:
+                x_diff     = np.zeros_like(x)
+                x_diff[1:] = x[1:] - x[:-1]
+                x          = x_diff
+
+            mats.append(x)
+        self.data = np.stack(mats, axis=0)  # (10, T, C)
+
+        # 6) 每文件按窗口划分：70%/15%/15% + 可选 gap
+        train_r, val_r, test_r = 0.7, 0.15, 0.15
+        n_train = max(1, round(n_all*train_r))
+        n_val   = max(1, round(n_all*val_r))
+        n_test  = n_all - n_train - n_val
+        if n_test < 1:
+            n_test = 1
+            if n_val > 1: n_val -= 1
+            elif n_train > 1: n_train -= 1
+
+        gap = int(round(n_all * self.VAL_TEST_GAP))
+        # 窗口索引区间
+        # train: [0, n_train)
+        # gap:   [n_train, n_train+gap)
+        # val:   [n_train+gap, n_train+gap+n_val)
+        # test:  [n_train+gap+n_val, n_train+gap+n_val+n_test)
+        # 注意：若 gap 过大导致区间越界，做降级处理
+        remain = n_all - n_train - gap
+        if remain < (n_val + n_test):
+            # 收缩 gap 以保证 val+test 至少各1
+            need = (n_val + n_test) - remain
+            gap  = max(0, gap - need)
+
         self.indices = []
         for f_idx in range(len(self.file_paths)):
-            if self.flag=='TRAIN':
+            if self.flag == 'TRAIN':
                 wins = range(0, n_train)
-            elif self.flag=='VAL':
-                wins = range(n_train, n_train+n_val)
-            else:  # TEST
-                wins = range(n_train+n_val, n)
+            elif self.flag == 'VAL':
+                wins = range(n_train + gap, n_train + gap + n_val)
+            else:
+                wins = range(n_train + gap + n_val, n_train + gap + n_val + n_test)
             for w in wins:
-                self.indices.append(f_idx*n + w)
+                self.indices.append(f_idx * n_all + w)
 
-        # 8) 供 Exp_Classification 读取用
+        # 7) 供 Exp_Classification 读取用
         self.max_seq_len = self.seq_len
         self.feature_df  = pd.DataFrame(np.zeros((1, feat_dim)))
 
@@ -1044,25 +1170,16 @@ class Dataset_Hell(Dataset):
         g = self.indices[idx]
         f_idx = g // self.windows_per_file
         w_idx = g %  self.windows_per_file
-        arr   = self.data[f_idx]  # (total_len,feat_dim)
+        arr   = self.data[f_idx]  # (T, C)
         start = w_idx * self.seq_len
         seg   = arr[start:start+self.seq_len]
         x = torch.from_numpy(seg).float()
-        y = torch.tensor(self.labels[f_idx],dtype=torch.long)
+        y = torch.tensor(self.labels[f_idx], dtype=torch.long)
         return x, y
 
-class Dataset_Van(Dataset):
-    """
-    Vänersborg（Van）桥梁三分类数据集加载器 —— 单文件每类
-    目录：
-        root_path/
-            type00.csv
-            type01.csv
-            type02.csv
-    列：ts, ch_1, ..., ch_30
-    """
 
-    # ===== 你给出的忽略通道（支持 'ch30' 自动转 'ch_30'；不存在的会提示并忽略）=====
+class Dataset_Van(Dataset):
+
     _IGNORE_CHANNELS = [
         'ch30',
         'ch_5',
