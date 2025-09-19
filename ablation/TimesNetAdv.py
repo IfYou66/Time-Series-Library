@@ -50,10 +50,16 @@ def auto_correlation(x: torch.Tensor, k: int, min_p: int = 3, max_p: int = None)
     very_neg = torch.finfo(dtype).min / 8 if dtype.is_floating_point else -1e9
     r_masked = torch.where(mask, r, torch.full_like(r, very_neg))
 
+    # p0 = max(min_p, min(max_p, max(2, T // 4)))
+    # if (mask.sum(dim=1) == 0).any():
+    #     r_masked[:] = very_neg
+    #     r_masked[:, p0] = 0.0
+    # 逐样本回退
     p0 = max(min_p, min(max_p, max(2, T // 4)))
-    if (mask.sum(dim=1) == 0).any():
-        r_masked[:] = very_neg
-        r_masked[:, p0] = 0.0
+    all_bad = (mask.sum(dim=1) == 0)
+    if all_bad.any():
+        r_masked[all_bad] = very_neg
+        r_masked[all_bad, p0] = 0.0
 
     k_eff = min(k, max_p - min_p + 1)
     vals, idx = torch.topk(r_masked, k=k_eff, dim=1)
