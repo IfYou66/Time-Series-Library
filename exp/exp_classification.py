@@ -9,6 +9,7 @@ import time
 import warnings
 import numpy as np
 from sklearn.metrics import f1_score   # ← 新增
+import pdb
 
 warnings.filterwarnings('ignore')
 
@@ -18,12 +19,19 @@ class Exp_Classification(Exp_Basic):
         super(Exp_Classification, self).__init__(args)
 
     def _build_model(self):
+        # model input depends on data
+        # self.args.seq_len - 序列长度
+        # self.args.enc_in - 输入特征维度
+        # self.args.num_class - 类别数量
         train_data, train_loader = self._get_data(flag='TRAIN')
         vali_data, vali_loader = self._get_data(flag='VAL')
+        # test_data, test_loader = self._get_data(flag='TEST')
+        # self.args.seq_len = max(train_data.max_seq_len, test_data.max_seq_len)
         self.args.seq_len = max(train_data.max_seq_len, vali_data.max_seq_len)
         self.args.pred_len = 0
         self.args.enc_in = train_data.feature_df.shape[1]
         self.args.num_class = len(train_data.class_names)
+        # model init
         model = self.model_dict[self.args.model].Model(self.args).float()
         if self.args.use_multi_gpu and self.args.use_gpu:
             model = nn.DataParallel(model, device_ids=self.args.device_ids)
@@ -34,6 +42,7 @@ class Exp_Classification(Exp_Basic):
         return data_set, data_loader
 
     def _select_optimizer(self):
+        # model_optim = optim.Adam(self.model.parameters(), lr=self.args.learning_rate)
         model_optim = optim.RAdam(self.model.parameters(), lr=self.args.learning_rate)
         return model_optim
 
@@ -54,9 +63,10 @@ class Exp_Classification(Exp_Basic):
 
                 outputs = self.model(batch_x, padding_mask, None, None)
 
-                # 全程在 GPU 上计算 loss
-                loss = criterion(outputs, label.long().squeeze())
-                total_loss.append(loss.item())
+                # 计算loss（放到CPU以匹配原代码风格）
+                pred_cpu = outputs.detach().cpu()
+                loss = criterion(pred_cpu, label.long().squeeze().cpu())
+                total_loss.append(loss.item())  # ← 记录标量
 
                 preds.append(outputs.detach())
                 trues.append(label)
@@ -66,11 +76,12 @@ class Exp_Classification(Exp_Basic):
         preds = torch.cat(preds, 0)
         trues = torch.cat(trues, 0)
 
-        # 评估时再转CPU
-        probs = torch.nn.functional.softmax(preds, dim=1).cpu().numpy()
-        predictions = np.argmax(probs, axis=1)
+        # 概率与预测
+        probs = torch.nn.functional.softmax(preds, dim=1)  # ← 显式指定dim
+        predictions = torch.argmax(probs, dim=1).cpu().numpy()
         trues_np = trues.flatten().cpu().numpy()
 
+        # 指标：ACC + F1(macro)
         accuracy = cal_accuracy(predictions, trues_np)
         f1_macro = f1_score(trues_np, predictions, average='macro')
 
@@ -87,6 +98,7 @@ class Exp_Classification(Exp_Basic):
             os.makedirs(path)
 
         time_now = time.time()
+
         train_steps = len(train_loader)
         early_stopping = EarlyStopping(patience=self.args.patience, verbose=True)
 
@@ -138,6 +150,7 @@ class Exp_Classification(Exp_Basic):
                         test_loss, test_accuracy, test_f1)
             )
 
+            # 仍按验证集ACC做早停，保持与你原来的逻辑一致
             early_stopping(-val_accuracy, self.model, path)
             if early_stopping.early_stop:
                 print("Early stopping")
@@ -145,6 +158,7 @@ class Exp_Classification(Exp_Basic):
 
         best_model_path = path + '/' + 'checkpoint.pth'
         self.model.load_state_dict(torch.load(best_model_path))
+
         return self.model
 
     def test(self, setting, test=0):
@@ -175,13 +189,16 @@ class Exp_Classification(Exp_Basic):
         trues = torch.cat(trues, 0)
         print('test shape:', preds.shape, trues.shape)
 
-        probs = torch.nn.functional.softmax(preds, dim=1).cpu().numpy()
-        predictions = np.argmax(probs, axis=1)
+        # 概率/预测
+        probs = torch.nn.functional.softmax(preds, dim=1)
+        predictions = torch.argmax(probs, dim=1).cpu().numpy()
         trues_np = trues.flatten().cpu().numpy()
 
+        # 指标：ACC + F1(macro)
         accuracy = cal_accuracy(predictions, trues_np)
         f1_macro = f1_score(trues_np, predictions, average='macro')
 
+        # result save
         folder_path = './results/' + setting + '/'
         if not os.path.exists(folder_path):
             os.makedirs(folder_path)
