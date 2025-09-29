@@ -139,23 +139,51 @@ class FourierLayer(nn.Module):
         self.k = k
         self.low_freq = low_freq
 
+    # def forward(self, x):
+    #     """x: (b, t, d)"""
+    #     b, t, d = x.shape
+    #     x_freq = fft.rfft(x, dim=1)
+    #
+    #     if t % 2 == 0:
+    #         x_freq = x_freq[:, self.low_freq:-1]
+    #         f = fft.rfftfreq(t)[self.low_freq:-1]
+    #     else:
+    #         x_freq = x_freq[:, self.low_freq:]
+    #         f = fft.rfftfreq(t)[self.low_freq:]
+    #
+    #     x_freq, index_tuple = self.topk_freq(x_freq)
+    #     f = repeat(f, 'f -> b f d', b=x_freq.size(0), d=x_freq.size(2))
+    #     f = rearrange(f[index_tuple], 'b f d -> b f () d').to(x_freq.device)
+    #
+    #     return self.extrapolate(x_freq, f, t)
     def forward(self, x):
-        """x: (b, t, d)"""
+        """x: (B, T, D)"""
         b, t, d = x.shape
-        x_freq = fft.rfft(x, dim=1)
+        x_freq = fft.rfft(x, dim=1)  # [B, F_all, D] complex
 
+        # 去掉最低频和 Nyquist（偶数长度时）
         if t % 2 == 0:
-            x_freq = x_freq[:, self.low_freq:-1]
-            f = fft.rfftfreq(t)[self.low_freq:-1]
+            x_freq = x_freq[:, self.low_freq:-1]  # [B, F, D]
+            f_vec = torch.fft.rfftfreq(t, d=1.0)  # [F_all]
+            f_vec = f_vec[self.low_freq:-1]  # [F]
         else:
-            x_freq = x_freq[:, self.low_freq:]
-            f = fft.rfftfreq(t)[self.low_freq:]
+            x_freq = x_freq[:, self.low_freq:]  # [B, F, D]
+            f_vec = torch.fft.rfftfreq(t, d=1.0)  # [F_all]
+            f_vec = f_vec[self.low_freq:]  # [F]
 
-        x_freq, index_tuple = self.topk_freq(x_freq)
-        f = repeat(f, 'f -> b f d', b=x_freq.size(0), d=x_freq.size(2))
-        f = rearrange(f[index_tuple], 'b f d -> b f () d').to(x_freq.device)
+        # 设备对齐
+        device = x_freq.device
+        f_vec = f_vec.to(device)
 
-        return self.extrapolate(x_freq, f, t)
+        # 取 Top-K 频率分量（按频率维）
+        x_freq_sel, idx = self.topk_freq(x_freq)  # x_freq_sel: [B,K,D], idx: [B,K,D]
+
+        # 将频率坐标 f_vec 按 idx 取出对应项：先扩展到 [B, F, D] 再 gather
+        f_expanded = f_vec.view(1, -1, 1).expand(b, x_freq.size(1), d)  # [B, F, D]
+        f_sel = torch.gather(f_expanded, dim=1, index=idx)  # [B, K, D]
+        f_sel = f_sel.unsqueeze(2)  # [B, K, 1, D] —— 对齐后续计算
+
+        return self.extrapolate(x_freq_sel, f_sel, t)
 
     def extrapolate(self, x_freq, f, t):
         x_freq = torch.cat([x_freq, x_freq.conj()], dim=1)
@@ -170,13 +198,24 @@ class FourierLayer(nn.Module):
 
         return reduce(x_time, 'b f t d -> b t d', 'sum')
 
+    # def topk_freq(self, x_freq):
+    #     values, indices = torch.topk(x_freq.abs(), self.k, dim=1, largest=True, sorted=True)
+    #     mesh_a, mesh_b = torch.meshgrid(torch.arange(x_freq.size(0)), torch.arange(x_freq.size(2)))
+    #     index_tuple = (mesh_a.unsqueeze(1).to(indices.device), indices, mesh_b.unsqueeze(1).to(indices.device))
+    #     x_freq = x_freq[index_tuple]
+    #
+    #     return x_freq, index_tuple
     def topk_freq(self, x_freq):
-        values, indices = torch.topk(x_freq.abs(), self.k, dim=1, largest=True, sorted=True)
-        mesh_a, mesh_b = torch.meshgrid(torch.arange(x_freq.size(0)), torch.arange(x_freq.size(2)))
-        index_tuple = (mesh_a.unsqueeze(1).to(indices.device), indices, mesh_b.unsqueeze(1).to(indices.device))
-        x_freq = x_freq[index_tuple]
-
-        return x_freq, index_tuple
+        """
+        x_freq: [B, F, D] (complex)
+        返回: x_sel: [B, K, D] (complex), idx: [B, K, D] (long)
+        """
+        # 幅度上取 Top-K（按频率维）
+        mag = x_freq.abs()  # [B, F, D]
+        _, idx = torch.topk(mag, self.k, dim=1, largest=True, sorted=True)  # [B, K, D]
+        # 用 gather 从 x_freq 选出对应的频率分量（与 idx 同形状）
+        x_sel = torch.gather(x_freq, dim=1, index=idx)  # [B, K, D] complex
+        return x_sel, idx
 
 
 class LevelLayer(nn.Module):

@@ -8,7 +8,7 @@ import os
 import time
 import warnings
 import numpy as np
-import pdb
+from sklearn.metrics import f1_score   # ← 新增
 
 warnings.filterwarnings('ignore')
 
@@ -18,19 +18,12 @@ class Exp_Classification(Exp_Basic):
         super(Exp_Classification, self).__init__(args)
 
     def _build_model(self):
-        # model input depends on data
-        # self.args.seq_len - 序列长度
-        # self.args.enc_in - 输入特征维度
-        # self.args.num_class - 类别数量
         train_data, train_loader = self._get_data(flag='TRAIN')
         vali_data, vali_loader = self._get_data(flag='VAL')
-        # test_data, test_loader = self._get_data(flag='TEST')
-        # self.args.seq_len = max(train_data.max_seq_len, test_data.max_seq_len)
         self.args.seq_len = max(train_data.max_seq_len, vali_data.max_seq_len)
         self.args.pred_len = 0
         self.args.enc_in = train_data.feature_df.shape[1]
         self.args.num_class = len(train_data.class_names)
-        # model init
         model = self.model_dict[self.args.model].Model(self.args).float()
         if self.args.use_multi_gpu and self.args.use_gpu:
             model = nn.DataParallel(model, device_ids=self.args.device_ids)
@@ -41,7 +34,6 @@ class Exp_Classification(Exp_Basic):
         return data_set, data_loader
 
     def _select_optimizer(self):
-        # model_optim = optim.Adam(self.model.parameters(), lr=self.args.learning_rate)
         model_optim = optim.RAdam(self.model.parameters(), lr=self.args.learning_rate)
         return model_optim
 
@@ -62,24 +54,28 @@ class Exp_Classification(Exp_Basic):
 
                 outputs = self.model(batch_x, padding_mask, None, None)
 
-                pred = outputs.detach().cpu()
-                loss = criterion(pred, label.long().squeeze().cpu())
-                total_loss.append(loss)
+                # 全程在 GPU 上计算 loss
+                loss = criterion(outputs, label.long().squeeze())
+                total_loss.append(loss.item())
 
                 preds.append(outputs.detach())
                 trues.append(label)
 
-        total_loss = np.average(total_loss)
+        total_loss = float(np.average(total_loss))
 
         preds = torch.cat(preds, 0)
         trues = torch.cat(trues, 0)
-        probs = torch.nn.functional.softmax(preds)  # (total_samples, num_classes) est. prob. for each class and sample
-        predictions = torch.argmax(probs, dim=1).cpu().numpy()  # (total_samples,) int class index for each sample
-        trues = trues.flatten().cpu().numpy()
-        accuracy = cal_accuracy(predictions, trues)
+
+        # 评估时再转CPU
+        probs = torch.nn.functional.softmax(preds, dim=1).cpu().numpy()
+        predictions = np.argmax(probs, axis=1)
+        trues_np = trues.flatten().cpu().numpy()
+
+        accuracy = cal_accuracy(predictions, trues_np)
+        f1_macro = f1_score(trues_np, predictions, average='macro')
 
         self.model.train()
-        return total_loss, accuracy
+        return total_loss, accuracy, f1_macro
 
     def train(self, setting):
         train_data, train_loader = self._get_data(flag='TRAIN')
@@ -91,7 +87,6 @@ class Exp_Classification(Exp_Basic):
             os.makedirs(path)
 
         time_now = time.time()
-
         train_steps = len(train_loader)
         early_stopping = EarlyStopping(patience=self.args.patience, verbose=True)
 
@@ -113,7 +108,6 @@ class Exp_Classification(Exp_Basic):
                 padding_mask = padding_mask.float().to(self.device)
                 label = label.to(self.device)
 
-                # print("batch_x", batch_x.shape)
                 outputs = self.model(batch_x, padding_mask, None, None)
                 loss = criterion(outputs, label.long().squeeze(-1))
                 train_loss.append(loss.item())
@@ -131,13 +125,19 @@ class Exp_Classification(Exp_Basic):
                 model_optim.step()
 
             print("Epoch: {} cost time: {}".format(epoch + 1, time.time() - epoch_time))
-            train_loss = np.average(train_loss)
-            vali_loss, val_accuracy = self.vali(vali_data, vali_loader, criterion)
-            test_loss, test_accuracy = self.vali(test_data, test_loader, criterion)
+            train_loss = float(np.average(train_loss))
+            vali_loss, val_accuracy, val_f1 = self.vali(vali_data, vali_loader, criterion)
+            test_loss, test_accuracy, test_f1 = self.vali(test_data, test_loader, criterion)
 
             print(
-                "Epoch: {0}, Steps: {1} | Train Loss: {2:.3f} Vali Loss: {3:.3f} Vali Acc: {4:.3f} Test Loss: {5:.3f} Test Acc: {6:.3f}"
-                .format(epoch + 1, train_steps, train_loss, vali_loss, val_accuracy, test_loss, test_accuracy))
+                "Epoch: {0}, Steps: {1} | Train Loss: {2:.3f} "
+                "Vali Loss: {3:.3f} Vali Acc: {4:.3f} Vali F1: {5:.3f} "
+                "Test Loss: {6:.3f} Test Acc: {7:.3f} Test F1: {8:.3f}"
+                .format(epoch + 1, train_steps, train_loss,
+                        vali_loss, val_accuracy, val_f1,
+                        test_loss, test_accuracy, test_f1)
+            )
+
             early_stopping(-val_accuracy, self.model, path)
             if early_stopping.early_stop:
                 print("Early stopping")
@@ -145,7 +145,6 @@ class Exp_Classification(Exp_Basic):
 
         best_model_path = path + '/' + 'checkpoint.pth'
         self.model.load_state_dict(torch.load(best_model_path))
-
         return self.model
 
     def test(self, setting, test=0):
@@ -176,22 +175,21 @@ class Exp_Classification(Exp_Basic):
         trues = torch.cat(trues, 0)
         print('test shape:', preds.shape, trues.shape)
 
-        probs = torch.nn.functional.softmax(preds)  # (total_samples, num_classes) est. prob. for each class and sample
-        predictions = torch.argmax(probs, dim=1).cpu().numpy()  # (total_samples,) int class index for each sample
-        trues = trues.flatten().cpu().numpy()
-        accuracy = cal_accuracy(predictions, trues)
+        probs = torch.nn.functional.softmax(preds, dim=1).cpu().numpy()
+        predictions = np.argmax(probs, axis=1)
+        trues_np = trues.flatten().cpu().numpy()
 
-        # result save
+        accuracy = cal_accuracy(predictions, trues_np)
+        f1_macro = f1_score(trues_np, predictions, average='macro')
+
         folder_path = './results/' + setting + '/'
         if not os.path.exists(folder_path):
             os.makedirs(folder_path)
 
-        print('accuracy:{}'.format(accuracy))
-        file_name='result_classification.txt'
-        f = open(os.path.join(folder_path,file_name), 'a')
-        f.write(setting + "  \n")
-        f.write('accuracy:{}'.format(accuracy))
-        f.write('\n')
-        f.write('\n')
-        f.close()
+        print('accuracy: {:.6f} | f1_macro: {:.6f}'.format(accuracy, f1_macro))
+        file_name = 'result_classification.txt'
+        with open(os.path.join(folder_path, file_name), 'a') as f:
+            f.write(setting + "  \n")
+            f.write('accuracy: {:.6f} | f1_macro: {:.6f}\n'.format(accuracy, f1_macro))
+            f.write('\n')
         return
