@@ -2,7 +2,7 @@ import os
 import torch
 
 from ablation import TimesNetAdv
-from baseline import TCN, AttentionLSTM, BiLSTM, GRU, LSTM, MALSTMFCN, ConvTran
+from baseline import TCN, AttentionLSTM, BiLSTM, GRU, LSTM, MALSTMFCN, ConvTran, Hydra, FCN, InceptionTime
 from models import Autoformer, Transformer, TimesNet, Nonstationary_Transformer, DLinear, FEDformer, \
     Informer, LightTS, Reformer, ETSformer, Pyraformer, PatchTST, MICN, Crossformer, FiLM, iTransformer, \
     Koopa, TiDE, FreTS, TimeMixer, TSMixer, SegRNN, MambaSimple, TemporalFusionTransformer, SCINet, PAttn, TimeXer, \
@@ -13,6 +13,9 @@ class Exp_Basic(object):
     def __init__(self, args):
         self.args = args
         self.model_dict = {
+            'InceptionTime':InceptionTime,
+            'FCN':FCN,
+            'Hydra':Hydra,
             'ConvTran':ConvTran,
             'MALSTMFCN':MALSTMFCN,
             'LSTM':LSTM,
