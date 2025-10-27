@@ -186,6 +186,24 @@ if __name__ == '__main__':
     parser.add_argument('--use_res_scale', type=int, default=1, help='1: enable ResidualScale on residual branches')
     parser.add_argument('--reflect_pad', type=int, default=1, help='1: use reflect padding in 1D->2D fold')
     parser.add_argument('--sk_tau', type=float, default=1.5, help='temperature for SK softmax, >1=flatter')
+    # ==== 双路径架构参数 ====
+    parser.add_argument('--use_dual_path', type=int, default=0,
+                        help='1: enable dual-path architecture (periodic + local-global)')
+    parser.add_argument('--local_kernel', type=int, default=7,
+                        help='kernel size for local branch depthwise conv (recommend 5/7/9/11)')
+    parser.add_argument('--use_global_attn', type=int, default=0,
+                        help='1: use self-attention in global branch; 0: use lightweight pooling')
+    parser.add_argument('--dual_fusion_mode', type=str, default='learnable',
+                        help='dual-path fusion mode: [learnable, fixed, adaptive]')
+    # ==== 动态门控与旁路控制参数 ====
+    parser.add_argument('--gate_alpha', type=float, default=4.0,
+                        help='frequency-prior strength for dynamic gating (larger = stronger prior)')
+    parser.add_argument('--gate_tau', type=float, default=0.5,
+                        help='confidence threshold of periodicity')
+    parser.add_argument('--dual_beta', type=float, default=0.3,
+                        help='scaling factor for local-global residual (limit side-path strength)')
+    parser.add_argument('--gate_warmup', type=int, default=0,
+                        help='freeze local-global side path for N epochs at training start')
 
     # TimeXer
     parser.add_argument('--patch_len', type=int, default=16, help='patch length')
