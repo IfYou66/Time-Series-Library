@@ -7,22 +7,15 @@
 --task_name classification --is_training 1 --root_path ./dataset/damage_detection_hell/ --model_id Hell --model TimesNetAdv --data Hell --e_layers 2 --batch_size 16 --d_model 16 --d_ff 32 --top_k 3 --itr 1 --learning_rate 0.001 --train_epochs 30 --patience 10 --num_workers 0 --use_series_decomp 1 --use_sk 1 --use_se 0 --se_strength 0.0 --use_cyc_conv1d 1 --cyc_conv_kernel 9 --use_gate_mlp 1 --use_res_scale 1
 --reflect_pad 1 --sk_tau 1.5 --use_dual_path 1 --local_kernel 7 --use_global_attn 0 --dual_fusion_mode learnable --des dual_learnable_7k --gate_alpha 5.0 --gate_tau 0.45 --dual_beta 0.25
 
-关闭趋势/季节分离
---task_name classification --is_training 1 --root_path ./dataset/damage_detection_hell/
---model_id Hell --model TimesNetAdv --data Hell --e_layers 2 --batch_size 16 --d_model 16 --d_ff 32 --top_k 3 --itr 1 --learning_rate 0.001 --train_epochs 30 --patience 10 --num_workers 0  --use_series_decomp 0 --use_sk 1 --use_se 0 --se_strength 0.0 --use_cyc_conv1d 1 --cyc_conv_kernel 9 --use_gate_mlp 1 --use_res_scale 1 --reflect_pad 1 --sk_tau 1.5 --des TimesNetAdv_ablate_SeriesDecomp
+去掉局部残差分支
+--task_name classification --is_training 1 --root_path ./dataset/damage_detection_hell/ --model_id Hell_noDual --model TimesNetAdv --data Hell --e_layers 2 --batch_size 16 --d_model 16 --d_ff 32 --top_k 3 --itr 1 --learning_rate 0.001 --train_epochs 30 --patience 10 --num_workers 0 --use_series_decomp 1 --use_sk 1 --use_se 0 --se_strength 0.0 --use_cyc_conv1d 1 --cyc_conv_kernel 9 --use_gate_mlp 1 --use_res_scale 1 --reflect_pad 1 --sk_tau 1.5 --use_dual_path 0 --local_kernel 7 --use_global_attn 0 --dual_fusion_mode learnable --gate_alpha 5.0 --gate_tau 0.45 --dual_beta 0.25 --des no_dual_path
 
-去掉 SK+SE
---task_name classification --is_training 1 --root_path ./dataset/damage_detection_hell/
---model_id Hell --model TimesNetAdv --data Hell --e_layers 2 --batch_size 16 --d_model 16 --d_ff 32 --top_k 3 --itr 1 --learning_rate 0.001 --train_epochs 30 --patience 10 --num_workers 0  --use_series_decomp 1 --use_sk 0 --use_se 0 --se_strength 0.0 --use_cyc_conv1d 1 --cyc_conv_kernel 9 --use_gate_mlp 1 --use_res_scale 1 --reflect_pad 1 --sk_tau 1.5 --des TimesNetAdv_ablate_SK_SE
+去掉频谱先验引导，关闭季节-趋势分解
+--task_name classification --is_training 1 --root_path ./dataset/damage_detection_hell/ --model_id Hell_noSPA_noDecomp --model TimesNetAdv --data Hell --e_layers 2 --batch_size 16 --d_model 16 --d_ff 32 --top_k 3 --itr 1 --learning_rate 0.001 --train_epochs 30 --patience 10 --num_workers 0 --use_series_decomp 0 --use_sk 1 --use_se 0 --se_strength 0.0 --use_cyc_conv1d 1 --cyc_conv_kernel 9 --use_gate_mlp 1 --use_res_scale 1 --reflect_pad 1 --sk_tau 1.5 --use_dual_path 1 --local_kernel 7 --use_global_attn 0 --dual_fusion_mode learnable --gate_alpha 0.0 --gate_tau 0.45 --dual_beta 0.25 --des no_spectral_prior_no_decomp
 
-CycLargeKernelConv1d → 周期维长程依赖（关闭以做消融）
---task_name classification --is_training 1 --root_path ./dataset/damage_detection_hell/ --model_id Hell --model TimesNetAdv --data Hell --e_layers 2 --batch_size 16 --d_model 16 --d_ff 32 --top_k 3 --itr 1 --learning_rate 0.001 --train_epochs 30 --patience 10 --num_workers 0 --use_series_decomp 1 --use_sk 1 --use_se 0 --se_strength 0.0 --use_cyc_conv1d 0 --use_gate_mlp 1 --use_res_scale 1 --reflect_pad 1 --sk_tau 1.5 --des TimesNetAdv_ablate_CycConv
+去掉环形卷积与环形对齐
+--task_name classification --is_training 1 --root_path ./dataset/damage_detection_hell/ --model_id Hell_noCyclic --model TimesNetAdv --data Hell --e_layers 2 --batch_size 16 --d_model 16 --d_ff 32 --top_k 3 --itr 1 --learning_rate 0.001 --train_epochs 30 --patience 10 --num_workers 0 --use_series_decomp 1 --use_sk 1 --use_se 0 --se_strength 0.0 --use_cyc_conv1d 0 --cyc_conv_kernel 9 --use_gate_mlp 1 --use_res_scale 1 --reflect_pad 0 --sk_tau 1.5 --use_dual_path 1 --local_kernel 7 --use_global_attn 0 --dual_fusion_mode learnable --gate_alpha 5.0 --gate_tau 0.45 --dual_beta 0.25 --des no_cyclic_phase
 
-内容感知门控 (gate_mlp)（关闭以做消融）
---task_name classification --is_training 1 --root_path ./dataset/damage_detection_hell/ --model_id Hell --model TimesNetAdv --data Hell --e_layers 2 --batch_size 16 --d_model 16 --d_ff 32 --top_k 3 --itr 1 --learning_rate 0.001 --train_epochs 30 --patience 10 --num_workers 0 --use_series_decomp 1 --use_sk 1 --use_se 0 --se_strength 0.0 --use_cyc_conv1d 1 --cyc_conv_kernel 9 --use_gate_mlp 0 --use_res_scale 1 --reflect_pad 1 --sk_tau 1.5 --des TimesNetAdv_ablate_GateMLP
-
-残差缩放 (ResidualScale) + 反射填充（同时关闭以做消融）
---task_name classification --is_training 1 --root_path ./dataset/damage_detection_hell/ --model_id Hell --model TimesNetAdv --data Hell --e_layers 2 --batch_size 16 --d_model 16 --d_ff 32 --top_k 3 --itr 1 --learning_rate 0.001 --train_epochs 30 --patience 10 --num_workers 0 --use_series_decomp 1 --use_sk 1 --use_se 0 --se_strength 0.0 --use_cyc_conv1d 1 --cyc_conv_kernel 9 --use_gate_mlp 1 --use_res_scale 0 --reflect_pad 0 --sk_tau 1.5 --des TimesNetAdv_ablate_ResScale_Reflect
 
 
 =========================Van数据集==========================
@@ -39,26 +32,13 @@ CycLargeKernelConv1d → 周期维长程依赖（关闭以做消融）
 --task_name classification --is_training 1 --root_path ./dataset/damage_detection_Vänersborg/ --model_id Van --model TimesNetAdv --data Van --e_layers 2 --batch_size 16 --d_model 16 --d_ff 32 --top_k 3 --itr 1 --learning_rate 0.001 --train_epochs 30 --patience 10 --num_workers 0 --use_series_decomp 1 --use_sk 1 --use_se 0 --se_strength 0.0 --use_cyc_conv1d 1 --cyc_conv_kernel 9 --use_gate_mlp 1 --use_res_scale 1
 --reflect_pad 1 --sk_tau 1.5 --use_dual_path 1 --local_kernel 7 --use_global_attn 0 --dual_fusion_mode learnable --des dual_learnable_7k --gate_alpha 5.0 --gate_tau 0.45 --dual_beta 0.25
 
-关闭趋势/季节分离
---task_name classification --is_training 1 --root_path ./dataset/damage_detection_Vänersborg/
---model_id Van --model TimesNetAdv --data Van --e_layers 2 --batch_size 16 --d_model 16 --d_ff 32 --top_k 3 --itr 1 --learning_rate 0.001 --train_epochs 30 --patience 10 --num_workers 0  --use_series_decomp 0 --use_sk 1 --use_se 0 --se_strength 0.0 --use_cyc_conv1d 1 --cyc_conv_kernel 9 --use_gate_mlp 1 --use_res_scale 1 --reflect_pad 1 --sk_tau 1.5 --des TimesNetAdv_ablate_SeriesDecomp
+去掉局部残差分支
+--task_name classification --is_training 1 --root_path ./dataset/damage_detection_Vänersborg/ --model_id Van_noDual --model TimesNetAdv --data Van --e_layers 2 --batch_size 16 --d_model 16 --d_ff 32 --top_k 3 --itr 1 --learning_rate 0.001 --train_epochs 30 --patience 10 --num_workers 0 --use_series_decomp 1 --use_sk 1 --use_se 0 --se_strength 0.0 --use_cyc_conv1d 1 --cyc_conv_kernel 9 --use_gate_mlp 1 --use_res_scale 1 --reflect_pad 1 --sk_tau 1.5 --use_dual_path 0 --local_kernel 7 --use_global_attn 0 --dual_fusion_mode learnable --gate_alpha 5.0 --gate_tau 0.45 --dual_beta 0.25 --des no_dual_path
 
-去掉 SK+SE
---task_name classification --is_training 1 --root_path ./dataset/damage_detection_Vänersborg/
---model_id Van --model TimesNetAdv --data Van --e_layers 2 --batch_size 16 --d_model 16 --d_ff 32 --top_k 3 --itr 1 --learning_rate 0.001 --train_epochs 30 --patience 10 --num_workers 0
---use_series_decomp 1 --use_sk 0 --use_se 0 --se_strength 0.0 --use_cyc_conv1d 1 --cyc_conv_kernel 9 --use_gate_mlp 1 --use_res_scale 1 --reflect_pad 1 --sk_tau 1.5 --des TimesNetAdv_ablate_SK_SE
+去掉频谱先验引导，关闭季节-趋势分解
+--task_name classification --is_training 1 --root_path ./dataset/damage_detection_Vänersborg/ --model_id Van_noSPA_noDecomp --model TimesNetAdv --data Van --e_layers 2 --batch_size 16 --d_model 16 --d_ff 32 --top_k 3 --itr 1 --learning_rate 0.001 --train_epochs 30 --patience 10 --num_workers 0 --use_series_decomp 0 --use_sk 1 --use_se 0 --se_strength 0.0 --use_cyc_conv1d 1 --cyc_conv_kernel 9 --use_gate_mlp 1 --use_res_scale 1 --reflect_pad 1 --sk_tau 1.5 --use_dual_path 1 --local_kernel 7 --use_global_attn 0 --dual_fusion_mode learnable --gate_alpha 0.0 --gate_tau 0.45 --dual_beta 0.25 --des no_spectral_prior_no_decomp
 
-CycLargeKernelConv1d → 周期维长程依赖（关闭以做消融）
---task_name classification --is_training 1 --root_path ./dataset/damage_detection_Vänersborg/
---model_id Van --model TimesNetAdv --data Van --e_layers 2 --batch_size 16 --d_model 16 --d_ff 32 --top_k 3 --itr 1 --learning_rate 0.001 --train_epochs 30 --patience 10 --num_workers 0
---use_series_decomp 1 --use_sk 1 --use_se 0 --se_strength 0.0 --use_cyc_conv1d 0 --use_gate_mlp 1 --use_res_scale 1 --reflect_pad 1 --sk_tau 1.5 --des TimesNetAdv_ablate_CycConv
+去掉环形卷积与环形对齐
+--task_name classification --is_training 1 --root_path ./dataset/damage_detection_Vänersborg/ --model_id Van_noCyclic --model TimesNetAdv --data Van --e_layers 2 --batch_size 16 --d_model 16 --d_ff 32 --top_k 3 --itr 1 --learning_rate 0.001 --train_epochs 30 --patience 10 --num_workers 0 --use_series_decomp 1 --use_sk 1 --use_se 0 --se_strength 0.0 --use_cyc_conv1d 0 --cyc_conv_kernel 9 --use_gate_mlp 1 --use_res_scale 1 --reflect_pad 0 --sk_tau 1.5 --use_dual_path 1 --local_kernel 7 --use_global_attn 0 --dual_fusion_mode learnable --gate_alpha 5.0 --gate_tau 0.45 --dual_beta 0.25 --des no_cyclic_phase
 
-内容感知门控 (gate_mlp)（关闭以做消融）
---task_name classification --is_training 1 --root_path ./dataset/damage_detection_Vänersborg/
---model_id Van --model TimesNetAdv --data Van --e_layers 2 --batch_size 16 --d_model 16 --d_ff 32 --top_k 3 --itr 1 --learning_rate 0.001 --train_epochs 30 --patience 10 --num_workers 0
---use_series_decomp 1 --use_sk 1 --use_se 0 --se_strength 0.0 --use_cyc_conv1d 1 --cyc_conv_kernel 9 --use_gate_mlp 0 --use_res_scale 1 --reflect_pad 1 --sk_tau 1.5 --des TimesNetAdv_ablate_GateMLP
 
-残差缩放 (ResidualScale) + 反射填充（同时关闭以做消融）
---task_name classification --is_training 1 --root_path ./dataset/damage_detection_Vänersborg/
---model_id Van --model TimesNetAdv --data Van --e_layers 2 --batch_size 16 --d_model 16 --d_ff 32 --top_k 3 --itr 1 --learning_rate 0.001 --train_epochs 30 --patience 10 --num_workers 0
---use_series_decomp 1 --use_sk 1 --use_se 0 --se_strength 0.0 --use_cyc_conv1d 1 --cyc_conv_kernel 9 --use_gate_mlp 1 --use_res_scale 0 --reflect_pad 0 --sk_tau 1.5 --des TimesNetAdv_ablate_ResScale_Reflect
