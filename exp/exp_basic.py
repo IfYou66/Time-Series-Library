@@ -7,13 +7,14 @@ from baseline import TCN, AttentionLSTM, BiLSTM, GRU, LSTM, MALSTMFCN, ConvTran,
 from models import Autoformer, Transformer, TimesNet, Nonstationary_Transformer, DLinear, FEDformer, \
     Informer, LightTS, Reformer, ETSformer, Pyraformer, PatchTST, MICN, Crossformer, FiLM, iTransformer, \
     Koopa, TiDE, FreTS, TimeMixer, TSMixer, SegRNN, MambaSimple, TemporalFusionTransformer, SCINet, PAttn, TimeXer, \
-    WPMixer, MultiPatchFormer, MyModule
+    WPMixer, MultiPatchFormer, MyModule, DSDNet
 
 
 class Exp_Basic(object):
     def __init__(self, args):
         self.args = args
         self.model_dict = {
+            'DSDNet':DSDNet,
             'OSCNN':OSCNN,
             'MPTSNet':MPTSNet,
             'InceptionTime':InceptionTime,

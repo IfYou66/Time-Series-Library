@@ -1,5 +1,6 @@
 import argparse
 import os
+import time
 import torch
 import torch.backends
 from exp.exp_long_term_forecasting import Exp_Long_Term_Forecast
@@ -299,8 +300,33 @@ if __name__ == '__main__':
             args.distil,
             args.des, ii)
 
+        total_params = sum(p.numel() for p in exp.model.parameters())
+        print('Model Parameters: {:,} ({:.2f}M)'.format(total_params, total_params / 1e6))
+
+        test_sample_count = None
+        try:
+            from data_provider.data_factory import data_provider
+            test_data, _ = data_provider(args, flag='test')
+            test_sample_count = len(test_data)
+        except Exception as exc:
+            print('Could not determine test set size for throughput calculation:', exc)
+
+        def _sync_device():
+            if args.use_gpu and args.gpu_type == 'cuda':
+                torch.cuda.synchronize()
+            elif args.use_gpu and args.gpu_type == 'mps' and hasattr(torch, 'mps') and hasattr(torch.mps, 'synchronize'):
+                torch.mps.synchronize()
+
         print('>>>>>>>testing : {}<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<'.format(setting))
+        _sync_device()
+        start_time = time.perf_counter()
         exp.test(setting, test=1)
+        _sync_device()
+        inference_time = time.perf_counter() - start_time
+        print('Total inference time: {:.4f}s'.format(inference_time))
+        if test_sample_count:
+            throughput = test_sample_count / inference_time if inference_time > 0 else float('inf')
+            print('Approx throughput: {:.2f} samples/s'.format(throughput))
         if args.gpu_type == 'mps':
             torch.backends.mps.empty_cache()
         elif args.gpu_type == 'cuda':

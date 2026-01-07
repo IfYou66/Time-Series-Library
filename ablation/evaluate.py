@@ -27,7 +27,7 @@ DEFAULT_CONFIG = {
     "pred_len": 0,
     "enc_in": 40,
     "num_class": 10,
-    "d_model": 16,
+    "d_model": 128,
     "d_ff": 32,
     "dropout": 0.1,
     "e_layers": 2,
@@ -122,7 +122,7 @@ def run_benchmark(parsed_args: argparse.Namespace):
         macs, _ = profile(model, inputs=(input_for_flops,), verbose=False)
         # 1 MAC (乘加运算) ≈ 2 FLOPs，但学术界通常直接汇报 MACs 或将其称为 FLOPs
         flops_g = macs / 1e9
-        print(f"   Theoretical FLOPs: {flops_g:.3f} G (Batch Size=1)")
+        print(f"   Theoretical FLOPs: {flops_g:.3f} G ")
     except Exception as e:
         print(f"   FLOPs calculation failed: {e}")
 
