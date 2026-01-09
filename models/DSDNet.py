@@ -8,109 +8,6 @@ import torch.nn.functional as F
 
 
 # ============================================================
-# Config (SE 已彻底删除)
-# ============================================================
-
-@dataclass
-class DSDNetConfig:
-    # Data / task
-    enc_in: int
-    num_class: int
-
-    # Backbone dims
-    d_model: int = 128
-    e_layers: int = 3
-    dropout: float = 0.1
-
-    # Period detection / decomposition
-    top_k: int = 3
-    moving_avg: int = 25
-    use_series_decomp: bool = True
-    min_period: int = 3
-    max_period: Optional[int] = None  # default: T//2 at runtime
-
-    # 2D conv trunk
-    conv2d_dropout: float = 0.0
-    use_sk: bool = True
-    sk_tau: float = 1.5
-    use_res_scale: bool = True
-    reflect_pad: bool = True
-
-    # cyc-axis modeling
-    use_cyc_conv1d: bool = True
-    cyc_conv_kernel: int = 9  # fixed kernel for speed
-
-    # Weighted aggregation
-    use_gate_mlp: bool = True  # sample-wise scalar gate for aggregation
-
-    # Dual-path (non-periodic)
-    use_dual_path: bool = True
-    local_kernel: int = 7
-    use_global_attn: bool = False  # simplified attn vs global pooling gate
-
-    # Fusion options
-    use_orthogonal: bool = True         # orthogonalize local residual w.r.t periodic residual
-    use_spa_gate: bool = True           # SPA bias gate with period confidence
-    gate_alpha: float = 4.0             # SPA bias strength
-    gate_tau: float = 0.5               # SPA threshold
-    dual_beta: float = 0.3              # local residual amplitude cap
-    gate_warmup_epochs: int = 0         # optionally freeze bypass early (0 disables)
-
-    # Normalization in 2D trunk (important for unified grid)
-    use_masked_gn2d: bool = True        # keep semantics closer under unified grid
-
-    # Pooling head
-    use_attention_pool: bool = True     # learnable query pooling
-
-
-def build_cfg_from_args(args) -> DSDNetConfig:
-    """
-    将 TimesNet 仓库的 argparse.Namespace 映射到 DSDNetConfig
-    注意：SE 已彻底移除，此处不再读取 use_se/se_strength
-    """
-    cfg = DSDNetConfig(
-        enc_in=getattr(args, "enc_in"),
-        num_class=getattr(args, "num_class"),
-
-        d_model=getattr(args, "d_model", 128),
-        e_layers=getattr(args, "e_layers", 3),
-        dropout=getattr(args, "dropout", 0.1),
-
-        top_k=getattr(args, "top_k", 3),
-        moving_avg=getattr(args, "moving_avg", 25),
-        use_series_decomp=bool(getattr(args, "use_series_decomp", 1)),
-        min_period=getattr(args, "min_period", 3),
-        max_period=getattr(args, "max_period", None),
-
-        conv2d_dropout=getattr(args, "conv2d_dropout", 0.0),
-        use_sk=bool(getattr(args, "use_sk", 1)),
-        sk_tau=float(getattr(args, "sk_tau", 1.5)),
-        use_res_scale=bool(getattr(args, "use_res_scale", 1)),
-        reflect_pad=bool(getattr(args, "reflect_pad", 1)),
-
-        use_cyc_conv1d=bool(getattr(args, "use_cyc_conv1d", 1)),
-        cyc_conv_kernel=int(getattr(args, "cyc_conv_kernel", 9)),
-
-        use_gate_mlp=bool(getattr(args, "use_gate_mlp", 1)),
-
-        use_dual_path=bool(getattr(args, "use_dual_path", 0)),
-        local_kernel=int(getattr(args, "local_kernel", 7)),
-        use_global_attn=bool(getattr(args, "use_global_attn", 0)),
-
-        use_orthogonal=True,
-        use_spa_gate=True,
-        gate_alpha=float(getattr(args, "gate_alpha", 4.0)),
-        gate_tau=float(getattr(args, "gate_tau", 0.5)),
-        dual_beta=float(getattr(args, "dual_beta", 0.3)),
-        gate_warmup_epochs=int(getattr(args, "gate_warmup", 0)),  # argparse: gate_warmup
-
-        use_masked_gn2d=True,
-        use_attention_pool=True,
-    )
-    return cfg
-
-
-# ============================================================
 # Utilities
 # ============================================================
 
@@ -143,16 +40,16 @@ class ResidualScale1D(nn.Module):
 
 def _period_confidence_from_wprior(w_prior: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
     """
-    w_prior: [B,k], softmax weights for top-k peaks
-    conf in [0,1], closer to 1 => clearer periodicity (lower entropy)
+    w_prior: [B,k] (softmax weights of correlation peaks)
+    Gamma ∈ [0,1], closer to 1 => clearer periodicity (lower entropy)
     """
     H = -(w_prior * (w_prior + eps).log()).sum(dim=1)  # [B]
     k = w_prior.size(1)
     if k <= 1:
         return torch.zeros_like(H)
     H_max = torch.log(torch.tensor(float(k), device=w_prior.device, dtype=w_prior.dtype) + eps)
-    conf = 1.0 - H / (H_max + eps)
-    return conf.clamp(0.0, 1.0)
+    Gamma = 1.0 - H / (H_max + eps)
+    return Gamma.clamp(0.0, 1.0)
 
 
 def _orth_residual(local_res: torch.Tensor, periodic_res: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
@@ -160,17 +57,17 @@ def _orth_residual(local_res: torch.Tensor, periodic_res: torch.Tensor, eps: flo
     local_res, periodic_res: [B,T,C]
     local' = local - proj(local on periodic)
     """
-    num = (local_res * periodic_res).sum(dim=1, keepdim=True)              # [B,1,C]
-    den = (periodic_res * periodic_res).sum(dim=1, keepdim=True).add(eps)  # [B,1,C]
-    proj = (num / den) * periodic_res                                     # [B,T,C]
+    num = (local_res * periodic_res).sum(dim=1, keepdim=True)                # [B,1,C]
+    den = (periodic_res * periodic_res).sum(dim=1, keepdim=True).add(eps)    # [B,1,C]
+    proj = (num / den) * periodic_res                                        # [B,T,C]
     return local_res - proj
 
 
 def _reflect_indices(t: torch.Tensor, T: int) -> torch.Tensor:
     """
     Right-side reflect padding indices for length T sequence.
-    t: [...], integer tensor
-    Return idx in [0, T-1]
+    t: integer tensor [...], t >= 0
+    return idx in [0, T-1]
     """
     if T <= 1:
         return torch.zeros_like(t)
@@ -181,28 +78,29 @@ def _reflect_indices(t: torch.Tensor, T: int) -> torch.Tensor:
 
 
 # ============================================================
-# Decomposition
+# Series decomposition
 # ============================================================
 
 class SeriesDecomp(nn.Module):
     def __init__(self, kernel_size: int):
         super().__init__()
         self.avg_pool = nn.AvgPool1d(
-            kernel_size=kernel_size, stride=1,
+            kernel_size=kernel_size,
+            stride=1,
             padding=(kernel_size - 1) // 2,
             count_include_pad=False
         )
 
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         # x: [B,T,C]
-        x_nct = x.permute(0, 2, 1)                     # [B,C,T]
+        x_nct = x.permute(0, 2, 1)                 # [B,C,T]
         trend = self.avg_pool(x_nct).permute(0, 2, 1)  # [B,T,C]
         seasonal = x - trend
         return seasonal, trend
 
 
 # ============================================================
-# Period detection (FFT-based autocorrelation)
+# FFT-based autocorrelation top-k (spectral prior)
 # ============================================================
 
 def auto_correlation_topk(
@@ -215,19 +113,21 @@ def auto_correlation_topk(
     x: [B,T,C]
     returns:
       idx: [B,k] (period lags)
-      w  : [B,k] (softmax weights from correlation peaks)
+      w  : [B,k] (softmax weights from peak values)
     """
     B, T, C = x.shape
     dtype = x.dtype
+
     if max_p is None:
         max_p = max(1, T // 2)
     max_p = max(min_p, min(max_p, T - 1))
 
-    Xf = torch.fft.rfft(x, dim=1)                 # [B,F,C]
-    P = (Xf * torch.conj(Xf)).real                # [B,F,C]
-    Pm = P.mean(dim=-1)                           # [B,F]
-    r = torch.fft.irfft(Pm, n=T, dim=1)           # [B,T]
+    Xf = torch.fft.rfft(x, dim=1)                  # [B,F,C]
+    P = (Xf * torch.conj(Xf)).real                 # [B,F,C]
+    Pm = P.mean(dim=-1)                            # [B,F]
+    r = torch.fft.irfft(Pm, n=T, dim=1)            # [B,T]
 
+    # mask valid lags
     mask = torch.ones_like(r, dtype=torch.bool)
     mask[:, 0] = False
     if min_p > 1:
@@ -257,13 +157,13 @@ def auto_correlation_topk(
 
 
 # ============================================================
-# Masked GroupNorm for 2D
+# Masked GroupNorm 2D (for unified grid + mask semantics)
 # ============================================================
 
 class MaskedGroupNorm2d(nn.Module):
     """
-    GroupNorm variant for [B,C,H,W] with spatial mask [B,1,H,W] (0/1).
-    Computes per-sample per-group mean/var over masked positions only.
+    GroupNorm for [B,C,H,W] with mask [B,1,H,W] ∈ {0,1}.
+    Computes mean/var only over masked positions.
     """
     def __init__(self, num_groups: int, num_channels: int, eps: float = 1e-5, affine: bool = True):
         super().__init__()
@@ -280,7 +180,6 @@ class MaskedGroupNorm2d(nn.Module):
             self.register_parameter("bias", None)
 
     def forward(self, x: torch.Tensor, mask: Optional[torch.Tensor] = None) -> torch.Tensor:
-        # x: [B,C,H,W], mask: [B,1,H,W]
         B, C, H, W = x.shape
         G = self.G
         xg = x.view(B, G, C // G, H, W)
@@ -296,14 +195,13 @@ class MaskedGroupNorm2d(nn.Module):
 
         xg = (xg - mean) / torch.sqrt(var + self.eps)
         y = xg.view(B, C, H, W)
-
         if self.affine:
             y = y * self.weight + self.bias
         return y
 
 
 # ============================================================
-# SK (SE 已删除)
+# SK merge (no SE)
 # ============================================================
 
 class SKMerge(nn.Module):
@@ -331,13 +229,13 @@ class SKMerge(nn.Module):
 
 
 # ============================================================
-# Periodic trunk: Inception 2D residual block (SK) + masked GN
+# Periodic trunk: Inception 2D residual block (SK optional)
 # ============================================================
 
 class Inception2DResBlock(nn.Module):
     """
-    Multi-scale periodic feature extractor on folded 2D plane.
-    Works on [B,C,H(=cyc),W(=p_max)] with mask.
+    Works on [B,C,H(=cyc_max),W(=p_max)] with optional mask.
+    NO SE logic.
     """
     def __init__(
         self,
@@ -346,17 +244,17 @@ class Inception2DResBlock(nn.Module):
         sk_tau: float = 1.5,
         use_res_scale: bool = True,
         drop: float = 0.0,
-        use_masked_gn: bool = True
+        use_masked_gn: bool = True,
     ):
         super().__init__()
         C = channels
         g = _best_gn_groups(C)
-        self.use_masked_gn = use_masked_gn
+        self.use_masked_gn = bool(use_masked_gn)
 
-        self.pre_gn = MaskedGroupNorm2d(g, C) if use_masked_gn else nn.GroupNorm(g, C)
+        self.pre_gn = MaskedGroupNorm2d(g, C) if self.use_masked_gn else nn.GroupNorm(g, C)
 
         def _gn():
-            return MaskedGroupNorm2d(g, C) if use_masked_gn else nn.GroupNorm(g, C)
+            return MaskedGroupNorm2d(g, C) if self.use_masked_gn else nn.GroupNorm(g, C)
 
         self.b3 = nn.Sequential(
             nn.Conv2d(C, C, 3, padding=1, groups=C, bias=False),
@@ -392,10 +290,6 @@ class Inception2DResBlock(nn.Module):
         return layer(x)
 
     def forward(self, z: torch.Tensor, mask2d: Optional[torch.Tensor] = None) -> torch.Tensor:
-        """
-        z: [B,C,H,W]
-        mask2d: [B,1,H,W], float {0,1}
-        """
         x = self._apply_norm(self.pre_gn, z, mask2d)
 
         def run_branch(seq: nn.Sequential, x_in: torch.Tensor) -> torch.Tensor:
@@ -430,14 +324,14 @@ class Inception2DResBlock(nn.Module):
 
 
 # ============================================================
-# cyc-axis conv1d (fixed large kernel)
+# cyc-axis conv1d (fixed kernel, no rep loops) — NO SE
 # ============================================================
 
 class CycAxisConv1d(nn.Module):
     """
-    z: [B,C,cyc,pmax]
-    u = mean over p -> [B,C,cyc]
-    depthwise conv1d along cyc with fixed kernel, then gated, broadcast back to 2D.
+    z: [B,C,cyc_max,p_max]
+    u = mean over p -> [B,C,cyc_max]
+    depthwise conv1d along cyc, gated, broadcast back to 2D.
     """
     def __init__(self, channels: int, kernel: int = 9, use_res_scale: bool = True):
         super().__init__()
@@ -461,8 +355,9 @@ class CycAxisConv1d(nn.Module):
         x = self.pw(x)
         x = self.norm(x)
         x = self.act(x)
-        x = x * self.gate(u)
-        x2d = x.unsqueeze(-1).expand_as(z)
+        x = x * self.gate(u)  # [B,C,cyc]
+
+        x2d = x.unsqueeze(-1).expand_as(z)  # [B,C,cyc,p]
         x2d = self.res_scale(x2d) if self.use_res_scale else x2d
         if mask2d is not None:
             x2d = x2d * mask2d
@@ -470,7 +365,7 @@ class CycAxisConv1d(nn.Module):
 
 
 # ============================================================
-# Non-periodic branch (Local-Global)
+# Non-periodic branch: Local-Global
 # ============================================================
 
 class SimplifiedAttention(nn.Module):
@@ -481,6 +376,7 @@ class SimplifiedAttention(nn.Module):
         self.num_heads = num_heads
         self.head_dim = channels // num_heads
         self.scale = self.head_dim ** -0.5
+
         self.qkv = nn.Linear(channels, channels * 3, bias=False)
         self.proj = nn.Linear(channels, channels, bias=False)
 
@@ -540,19 +436,19 @@ class LocalGlobalBranch(nn.Module):
         loc = self.merge(torch.cat([a, b], dim=1))  # [B,C,T]
 
         if self.use_global_attn:
-            loc_ntc = loc.permute(0, 2, 1)
-            glob_ntc = self.attn(loc_ntc)
-            glob = glob_ntc.permute(0, 2, 1)
+            loc_ntc = loc.permute(0, 2, 1)     # [B,T,C]
+            glob_ntc = self.attn(loc_ntc)      # [B,T,C]
+            glob = glob_ntc.permute(0, 2, 1)   # [B,C,T]
         else:
-            gate = self.global_gate(loc)
+            gate = self.global_gate(loc)       # [B,C,1]
             glob = loc * gate
 
         out = x_nct + self.res_scale(glob)
-        return out.permute(0, 2, 1)  # [B,T,C]
+        return out.permute(0, 2, 1)            # [B,T,C]
 
 
 # ============================================================
-# Batched fold/unfold (unified 2D grid + mask)
+# Batched fold/unfold: unified 2D grid + mask (parallel over N=B*k)
 # ============================================================
 
 def fold_candidates_to_grid(
@@ -564,53 +460,60 @@ def fold_candidates_to_grid(
     reflect_pad: bool = True
 ) -> Tuple[torch.Tensor, torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
     """
-    s_flat: [N,T,C]
-    p_flat: [N]
+    s_flat: [N,T,C] (already expanded from [B,T,C] by k candidates)
+    p_flat: [N] (period per candidate)
     Returns:
       Z: [N,C,cyc_max,p_max]
       mask2d: [N,1,cyc_max,p_max] float {0,1}
-      idx_map: (cyc_T, pos_T) each [N,T] for unfold
+      idx_map: (cyc_T, pos_T) each [N,T] for unfolding
     """
     device = s_flat.device
     dtype = s_flat.dtype
     N, _, C = s_flat.shape
 
     p_flat = p_flat.clamp_min(1)
+    # per-candidate padded length to multiple of p: T_pad_i = ceil(T/p)*p
     tpad = ((T + p_flat - 1) // p_flat) * p_flat  # [N]
     tpad_max = int(tpad.max().item())
 
+    # time indices [0..tpad_max-1]
     t_all = torch.arange(tpad_max, device=device, dtype=torch.long).view(1, -1).expand(N, -1)  # [N,tpad_max]
     time_valid = t_all < tpad.view(N, 1)  # [N,tpad_max]
 
+    # fetch source samples with reflect/constant padding
     if reflect_pad:
         src_idx = _reflect_indices(t_all, T)  # [N,tpad_max]
         s_src = s_flat.gather(1, src_idx.unsqueeze(-1).expand(N, tpad_max, C))  # [N,tpad_max,C]
     else:
         src_idx = t_all.clamp_max(T - 1)
         s_src = s_flat.gather(1, src_idx.unsqueeze(-1).expand(N, tpad_max, C))
-        s_src = s_src * (t_all < T).unsqueeze(-1)
+        s_src = s_src * (t_all < T).unsqueeze(-1).to(dtype)
 
     s_src = s_src * time_valid.unsqueeze(-1).to(dtype)
 
-    cyc_idx = t_all // p_flat.view(N, 1)
-    pos_idx = t_all - cyc_idx * p_flat.view(N, 1)
-
+    # 2D coords
+    cyc_idx = t_all // p_flat.view(N, 1)                    # [N,tpad_max]
+    pos_idx = t_all - cyc_idx * p_flat.view(N, 1)           # [N,tpad_max]
     valid2d = time_valid & (pos_idx < p_flat.view(N, 1)) & (pos_idx < p_max) & (cyc_idx < cyc_max)
 
     HW = cyc_max * p_max
-    spatial = (cyc_idx * p_max + pos_idx).clamp(0, HW - 1)  # [N,tpad_max]
+    spatial = (cyc_idx * p_max + pos_idx).clamp(0, HW - 1)   # [N,tpad_max]
 
+    # scatter into grid
     Z_flat = torch.zeros((N, C, HW), device=device, dtype=dtype)
-    idx_sp = spatial.unsqueeze(1).expand(N, C, tpad_max)
-    src = s_src.permute(0, 2, 1) * valid2d.unsqueeze(1).to(dtype)
+    idx_sp = spatial.unsqueeze(1).expand(N, C, tpad_max)     # [N,C,tpad_max]
+    src = s_src.permute(0, 2, 1)                             # [N,C,tpad_max]
+    src = src * valid2d.unsqueeze(1).to(dtype)
     Z_flat.scatter_(2, idx_sp, src)
     Z = Z_flat.view(N, C, cyc_max, p_max)
 
+    # build mask2d by scattering ones
     M_flat = torch.zeros((N, 1, HW), device=device, dtype=dtype)
     M_src = valid2d.to(dtype).unsqueeze(1)
     M_flat.scatter_(2, spatial.unsqueeze(1), M_src)
     mask2d = M_flat.view(N, 1, cyc_max, p_max)
 
+    # map for original T
     t_T = torch.arange(T, device=device, dtype=torch.long).view(1, -1).expand(N, -1)  # [N,T]
     cyc_T = (t_T // p_flat.view(N, 1)).clamp(0, cyc_max - 1)
     pos_T = (t_T - (t_T // p_flat.view(N, 1)) * p_flat.view(N, 1)).clamp(0, p_max - 1)
@@ -626,20 +529,70 @@ def unfold_grid_to_series(
     """
     Z: [N,C,cyc_max,p_max]
     idx_map: (cyc_T, pos_T) each [N,T]
-    Return y: [N,T,C]
+    return: [N,T,C]
     """
     N, C, cyc_max, p_max = Z.shape
     cyc_T, pos_T = idx_map
     HW = cyc_max * p_max
     Z_flat = Z.view(N, C, HW)
-    spatial_T = (cyc_T * p_max + pos_T).clamp(0, HW - 1)
+    spatial_T = (cyc_T * p_max + pos_T).clamp(0, HW - 1)  # [N,T]
     idx_sp = spatial_T.unsqueeze(1).expand(N, C, T)
-    y = Z_flat.gather(2, idx_sp)  # [N,C,T]
-    return y.permute(0, 2, 1).contiguous()  # [N,T,C]
+    y = Z_flat.gather(2, idx_sp)                          # [N,C,T]
+    return y.permute(0, 2, 1).contiguous()                # [N,T,C]
 
 
 # ============================================================
-# DSD Block: Periodic trunk + optional dual-path fusion
+# Config (built from argparse Namespace)
+# ============================================================
+
+@dataclass
+class DSDNetConfig:
+    enc_in: int
+    num_class: int
+
+    d_model: int = 128
+    e_layers: int = 2
+    dropout: float = 0.1
+
+    # periodic detection / decomposition
+    top_k: int = 3
+    moving_avg: int = 25
+    min_period: int = 3
+    max_period: Optional[int] = None
+
+    # 2D trunk
+    conv2d_dropout: float = 0.0
+    use_sk: bool = True
+    sk_tau: float = 1.5
+    use_res_scale: bool = True
+    reflect_pad: bool = True
+    use_masked_gn2d: bool = True
+
+    # cyc-axis
+    use_cyc_conv1d: bool = True
+    cyc_conv_kernel: int = 9
+
+    # weighted aggregation
+    use_gate_mlp: bool = True
+
+    # dual-path
+    use_dual_path: bool = True
+    local_kernel: int = 7
+    use_global_attn: bool = False
+
+    # fusion (paper)
+    dual_fusion_mode: str = "learnable"   # ["learnable","fixed","adaptive"]
+    use_orthogonal: bool = True
+    gate_alpha: float = 4.0
+    gate_tau: float = 0.5
+    dual_beta: float = 0.3
+
+    # head
+    use_attention_pool: bool = True
+
+
+# ============================================================
+# DSDBlock (paper core): periodic trunk + periodic fusion module
 # ============================================================
 
 class DSDBlock(nn.Module):
@@ -649,10 +602,13 @@ class DSDBlock(nn.Module):
         self.d_model = cfg.d_model
         self.k = cfg.top_k
         self.min_p = cfg.min_period
+        self.eps = 1e-8
 
-        self.use_series_decomp = bool(cfg.use_series_decomp)
-        self.decomp = SeriesDecomp(cfg.moving_avg) if self.use_series_decomp else None
+        # decomposition ablation
+        self.use_series_decomp = True  # controlled externally by Model from args
+        self.decomp = SeriesDecomp(cfg.moving_avg)
 
+        # periodic trunk
         self.block2d = Inception2DResBlock(
             channels=cfg.d_model,
             use_sk=cfg.use_sk,
@@ -661,10 +617,10 @@ class DSDBlock(nn.Module):
             drop=cfg.conv2d_dropout,
             use_masked_gn=cfg.use_masked_gn2d,
         )
-
         self.cyc1d = CycAxisConv1d(cfg.d_model, kernel=cfg.cyc_conv_kernel, use_res_scale=cfg.use_res_scale) \
             if cfg.use_cyc_conv1d else None
 
+        # candidate content gate for aggregation (sample-wise scalar)
         self.gate_mlp = None
         if cfg.use_gate_mlp:
             hidden = max(8, cfg.d_model // 4)
@@ -674,7 +630,9 @@ class DSDBlock(nn.Module):
                 nn.Linear(hidden, 1)
             )
 
+        # non-periodic branch
         self.local_branch = None
+        self.gating_network = None
         if cfg.use_dual_path:
             self.local_branch = LocalGlobalBranch(
                 channels=cfg.d_model,
@@ -682,20 +640,20 @@ class DSDBlock(nn.Module):
                 use_global_attn=cfg.use_global_attn
             )
 
+            # Paper: content-adaptive gate based on Hp/Hnp content, with Gamma prior
+            # We use pooled features: [mean(Hp), mean(Hnp), mean(Hnp-Hp)] => dim 3C
             hidden = max(16, cfg.d_model // 4)
+            in_dim = cfg.d_model * 3
             self.gating_network = nn.Sequential(
-                nn.Linear(cfg.d_model, hidden),
+                nn.Linear(in_dim, hidden),
                 nn.GELU(),
                 nn.Linear(hidden, cfg.d_model)
             )
+            # init: default "closed"
             nn.init.zeros_(self.gating_network[0].weight)
             nn.init.zeros_(self.gating_network[0].bias)
             nn.init.xavier_uniform_(self.gating_network[2].weight)
             nn.init.constant_(self.gating_network[2].bias, -2.0)
-
-            self.register_buffer("_fw_steps", torch.zeros((), dtype=torch.long), persistent=False)
-
-        self.eps = 1e-8
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -704,39 +662,46 @@ class DSDBlock(nn.Module):
         B, T, C = x.shape
         assert C == self.d_model
 
-        if self.decomp is not None:
-            s, t = self.decomp(x)  # [B,T,C], [B,T,C]
+        # ---- decompose ----
+        if self.use_series_decomp and self.decomp is not None:
+            s, t = self.decomp(x)  # [B,T,C]
         else:
             s, t = x, torch.zeros_like(x)
 
+        # ---- periods & w_prior ----
         max_p = self.cfg.max_period if self.cfg.max_period is not None else (T // 2)
         idx, w_prior = auto_correlation_topk(s, self.k, min_p=self.min_p, max_p=max_p)  # [B,k], [B,k]
 
+        # ---- expand candidates: N=B*k ----
         N = B * self.k
         p_flat = idx.reshape(-1).to(torch.long)          # [N]
         w_flat = w_prior.reshape(-1).to(x.dtype)         # [N]
-
         s_flat = s.unsqueeze(1).expand(B, self.k, T, C).reshape(N, T, C).contiguous()
 
+        # ---- unified grid sizes ----
         p_max = int(max_p)
         cyc_max = int((T + self.min_p - 1) // self.min_p)  # ceil(T/min_p)
 
+        # ---- fold all candidates in parallel ----
         Z, mask2d, idx_map = fold_candidates_to_grid(
             s_flat, p_flat=p_flat, T=T, p_max=p_max, cyc_max=cyc_max, reflect_pad=self.cfg.reflect_pad
         )
         Z = Z * mask2d
 
+        # ---- periodic trunk ----
         Z = self.block2d(Z, mask2d=mask2d)
         if self.cyc1d is not None:
             Z = self.cyc1d(Z, mask2d=mask2d)
-
         Z = Z * mask2d
+
+        # ---- unfold back ----
         Y = unfold_grid_to_series(Z, idx_map=idx_map, T=T)  # [N,T,C]
 
+        # ---- candidate weighting: w_prior + optional content gate ----
         w_term = (w_flat + self.eps).log().view(N, 1, 1)
         if self.gate_mlp is not None:
-            gate = torch.sigmoid(self.gate_mlp(Y.mean(dim=1)))  # [N,1]
-            g_term = (gate + self.eps).log().view(N, 1, 1)
+            gate_s = torch.sigmoid(self.gate_mlp(Y.mean(dim=1)))  # [N,1]
+            g_term = (gate_s + self.eps).log().view(N, 1, 1)
             score = w_term + g_term
         else:
             score = w_term
@@ -744,116 +709,153 @@ class DSDBlock(nn.Module):
         weight = torch.exp(score)  # [N,1,1]
         Yw = Y * weight
 
+        # ---- aggregate across k (parallel) ----
         Yw = Yw.view(B, self.k, T, C)
         weight = weight.view(B, self.k, 1, 1)
+        agg_num = Yw.sum(dim=1)                          # [B,T,C]
+        agg_den = weight.sum(dim=1).clamp_min(self.eps)  # [B,1,1]
+        agg = agg_num / agg_den                          # [B,T,C]
 
-        agg_num = Yw.sum(dim=1)
-        agg_den = weight.sum(dim=1).clamp_min(self.eps)
-        agg = agg_num / agg_den
+        # ---- periodic output ----
+        Hp = agg + x  # paper-consistent seasonal replacement + trend passthrough collapses to agg + x
+        periodic_res = Hp - x
 
-        periodic_out = agg + t + (x - t)  # == agg + x
-        periodic_residual = periodic_out - x
+        # ---- if no dual path ----
+        if (not self.cfg.use_dual_path) or (self.local_branch is None):
+            return Hp
 
-        if not self.cfg.use_dual_path or self.local_branch is None:
-            return periodic_out
+        # ---- non-periodic branch ----
+        Hnp = self.local_branch(x)    # [B,T,C]
 
-        local_out = self.local_branch(x)
-        local_res = local_out - x
+        # Paper: inject non-periodic info as residual on Hp
+        res_np = Hnp - Hp             # [B,T,C]
 
+        # optional orthogonalization (keep complement)
         if self.cfg.use_orthogonal:
-            local_res = _orth_residual(local_res, periodic_residual.detach())
+            res_np = _orth_residual(res_np, periodic_res.detach())
 
-        if self.cfg.use_spa_gate:
-            with torch.no_grad():
-                conf = _period_confidence_from_wprior(w_prior)  # [B]
+        # Gamma periodic confidence
+        with torch.no_grad():
+            Gamma = _period_confidence_from_wprior(w_prior)  # [B] in [0,1]
+
+        mode = (self.cfg.dual_fusion_mode or "learnable").lower()
+
+        if mode == "fixed":
+            gate = torch.ones((B, 1, C), device=x.device, dtype=x.dtype)
+
+        elif mode == "adaptive":
+            # gate = sigmoid( -alpha*(Gamma - tau) ), broadcast to channels
+            g_prior = -self.cfg.gate_alpha * (Gamma - self.cfg.gate_tau)  # [B]
+            gate = torch.sigmoid(g_prior).view(B, 1, 1).expand(B, 1, C)
+
         else:
-            conf = torch.zeros((B,), device=x.device, dtype=x.dtype)
+            # learnable: content-adaptive gate with Gamma prior constraint
+            Hp_g = Hp.mean(dim=1)         # [B,C]
+            Hnp_g = Hnp.mean(dim=1)       # [B,C]
+            res_g = res_np.mean(dim=1)    # [B,C]
+            gate_in = torch.cat([Hp_g, Hnp_g, res_g], dim=-1)  # [B,3C]
+            g_logit = self.gating_network(gate_in)             # [B,C]
+            # Gamma prior: periodic stronger => close gate
+            g_logit = g_logit - self.cfg.gate_alpha * (Gamma - self.cfg.gate_tau).unsqueeze(-1)
+            gate = torch.sigmoid(g_logit).unsqueeze(1)         # [B,1,C]
 
-        x_global = x.mean(dim=1)
-        g_logit = self.gating_network(x_global)
-
-        if self.cfg.use_spa_gate:
-            g_logit = g_logit - self.cfg.gate_alpha * (conf - self.cfg.gate_tau).unsqueeze(-1)
-
-        gate = torch.sigmoid(g_logit).unsqueeze(1)  # [B,1,C]
-
-        # warmup: 近似（建议更严格的 warmup 放到训练 loop）
-        if self.training and self.cfg.gate_warmup_epochs > 0:
-            self._fw_steps = self._fw_steps + 1
-            if self._fw_steps.item() < int(self.cfg.gate_warmup_epochs * 400):
-                gate = gate * 0.0
-
-        out = periodic_out + gate * (self.cfg.dual_beta * local_res)
+        out = Hp + gate * (self.cfg.dual_beta * res_np)
         return out
 
 
 # ============================================================
-# DSD-Net model
-# ============================================================
-
-class DSDNet(nn.Module):
-    """
-    Integrated DSD-Net: project -> stacked DSDBlock -> norm -> pooling -> classifier
-    """
-    def __init__(self, cfg: DSDNetConfig):
-        super().__init__()
-        self.cfg = cfg
-        self.d_model = cfg.d_model
-
-        self.project = nn.Linear(cfg.enc_in, cfg.d_model)
-
-        self.blocks = nn.ModuleList([DSDBlock(cfg) for _ in range(cfg.e_layers)])
-        self.norms = nn.ModuleList([nn.LayerNorm(cfg.d_model) for _ in range(cfg.e_layers)])
-
-        self.use_attention_pool = bool(cfg.use_attention_pool)
-        if self.use_attention_pool:
-            self.pool_q = nn.Parameter(torch.randn(1, 1, cfg.d_model))
-
-        self.dropout = nn.Dropout(cfg.dropout)
-        self.classifier = nn.Linear(cfg.d_model, cfg.num_class)
-
-        self.logit_T = nn.Parameter(torch.tensor(1.0, dtype=torch.float32))
-
-    def attention_pool(self, x: torch.Tensor) -> torch.Tensor:
-        B, T, C = x.shape
-        q = self.pool_q.expand(B, -1, -1)
-        att = (q @ x.transpose(1, 2)) / (C ** 0.5)
-        att = torch.softmax(att, dim=-1)
-        return (att @ x).squeeze(1)
-
-    def forward(self, x_enc: torch.Tensor) -> torch.Tensor:
-        """
-        x_enc: [B,T,enc_in]
-        return logits: [B,num_class]
-        """
-        x = self.project(x_enc)
-        for blk, ln in zip(self.blocks, self.norms):
-            x = ln(blk(x))
-
-        if self.use_attention_pool:
-            x = self.attention_pool(x)
-        else:
-            x = x.mean(dim=1)
-
-        x = self.dropout(x)
-        logits = self.classifier(x) / self.logit_T.clamp_min(1e-6)
-        return logits
-
-
-# ============================================================
-# TimesNet repo wrapper: must expose class Model
+# DSD-Net model: project -> blocks -> pooling -> classifier
+# Exposes class Model (TimesNet codebase requirement)
 # ============================================================
 
 class Model(nn.Module):
     """
-    TimesNet 仓库兼容包装层：
-    Exp_Classification 会调用：Model(args).forward(batch_x, padding_mask, None, None)
+    This is the entry expected by:
+      model = self.model_dict[args.model].Model(args)
     """
     def __init__(self, args):
         super().__init__()
-        cfg = build_cfg_from_args(args)
-        self.net = DSDNet(cfg)
 
-    def forward(self, x_enc, x_mark_enc=None, x_dec=None, x_mark_dec=None, **kwargs):
-        # classification: x_mark_enc 通常是 padding_mask；当前实现不依赖它
-        return self.net(x_enc)
+        # ---- build cfg from args (Namespace) ----
+        cfg = DSDNetConfig(
+            enc_in=int(getattr(args, "enc_in")),
+            num_class=int(getattr(args, "num_class", getattr(args, "c_out", 2))),
+            d_model=int(getattr(args, "d_model")),
+            e_layers=int(getattr(args, "e_layers")),
+            dropout=float(getattr(args, "dropout", 0.1)),
+
+            top_k=int(getattr(args, "top_k", 3)),
+            moving_avg=int(getattr(args, "moving_avg", 25)),
+            min_period=int(getattr(args, "min_period", 3)),
+            max_period=getattr(args, "max_period", None),
+
+            conv2d_dropout=float(getattr(args, "conv2d_dropout", 0.0)),
+            use_sk=bool(int(getattr(args, "use_sk", 1))),
+            sk_tau=float(getattr(args, "sk_tau", 1.5)),
+            use_res_scale=bool(int(getattr(args, "use_res_scale", 1))),
+            reflect_pad=bool(int(getattr(args, "reflect_pad", 1))),
+            use_masked_gn2d=True,
+
+            use_cyc_conv1d=bool(int(getattr(args, "use_cyc_conv1d", 1))),
+            cyc_conv_kernel=int(getattr(args, "cyc_conv_kernel", 9)),
+
+            use_gate_mlp=bool(int(getattr(args, "use_gate_mlp", 1))),
+
+            use_dual_path=bool(int(getattr(args, "use_dual_path", 0))),
+            local_kernel=int(getattr(args, "local_kernel", 7)),
+            use_global_attn=bool(int(getattr(args, "use_global_attn", 0))),
+
+            dual_fusion_mode=str(getattr(args, "dual_fusion_mode", "learnable")),
+            use_orthogonal=True,
+            gate_alpha=float(getattr(args, "gate_alpha", 4.0)),
+            gate_tau=float(getattr(args, "gate_tau", 0.5)),
+            dual_beta=float(getattr(args, "dual_beta", 0.3)),
+
+            use_attention_pool=True,
+        )
+        self.cfg = cfg
+
+        # ---- input projection ----
+        self.project = nn.Linear(cfg.enc_in, cfg.d_model)
+
+        # ---- blocks + per-block LayerNorm ----
+        self.blocks = nn.ModuleList([DSDBlock(cfg) for _ in range(cfg.e_layers)])
+        self.norms = nn.ModuleList([nn.LayerNorm(cfg.d_model) for _ in range(cfg.e_layers)])
+
+        # control series decomp ablation at block-level (keeps structure but disables module)
+        use_series_decomp = bool(int(getattr(args, "use_series_decomp", 1)))
+        for b in self.blocks:
+            b.use_series_decomp = use_series_decomp
+            if not use_series_decomp:
+                b.decomp = None
+
+        # ---- pooling head ----
+        self.pool_q = nn.Parameter(torch.randn(1, 1, cfg.d_model))
+        self.dropout = nn.Dropout(cfg.dropout)
+        self.classifier = nn.Linear(cfg.d_model, cfg.num_class)
+
+        # optional temperature (kept for compatibility)
+        self.logit_T = nn.Parameter(torch.tensor(1.0, dtype=torch.float32))
+
+    def attention_pool(self, x: torch.Tensor) -> torch.Tensor:
+        # x: [B,T,C] -> [B,C]
+        B, T, C = x.shape
+        q = self.pool_q.expand(B, -1, -1)                   # [B,1,C]
+        att = (q @ x.transpose(1, 2)) / (C ** 0.5)          # [B,1,T]
+        att = torch.softmax(att, dim=-1)
+        return (att @ x).squeeze(1)
+
+    def forward(self, x_enc: torch.Tensor, *args, **kwargs) -> torch.Tensor:
+        """
+        Classification:
+          x_enc: [B,T,enc_in]
+        TimesNet codebase may pass extra marks; we ignore them safely.
+        """
+        x = self.project(x_enc)  # [B,T,d]
+        for blk, ln in zip(self.blocks, self.norms):
+            x = ln(blk(x))
+
+        x = self.attention_pool(x)  # [B,d]
+        x = self.dropout(x)
+        logits = self.classifier(x) / self.logit_T.clamp_min(1e-6)
+        return logits
