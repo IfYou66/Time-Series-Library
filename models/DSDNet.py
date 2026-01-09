@@ -93,8 +93,8 @@ class SeriesDecomp(nn.Module):
 
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         # x: [B,T,C]
-        x_nct = x.permute(0, 2, 1)                 # [B,C,T]
-        trend = self.avg_pool(x_nct).permute(0, 2, 1)  # [B,T,C]
+        x_nct = x.permute(0, 2, 1)                     # [B,C,T]
+        trend = self.avg_pool(x_nct).permute(0, 2, 1)   # [B,T,C]
         seasonal = x - trend
         return seasonal, trend
 
@@ -127,7 +127,6 @@ def auto_correlation_topk(
     Pm = P.mean(dim=-1)                            # [B,F]
     r = torch.fft.irfft(Pm, n=T, dim=1)            # [B,T]
 
-    # mask valid lags
     mask = torch.ones_like(r, dtype=torch.bool)
     mask[:, 0] = False
     if min_p > 1:
@@ -191,6 +190,7 @@ class MaskedGroupNorm2d(nn.Module):
             mg = mask.view(B, 1, 1, H, W)
             denom = mg.sum(dim=(2, 3, 4), keepdim=True).clamp_min(1.0)
             mean = (xg * mg).sum(dim=(2, 3, 4), keepdim=True) / denom
+            # keep semantics; you can further micro-optimize later if needed
             var = ((xg - mean) ** 2 * mg).sum(dim=(2, 3, 4), keepdim=True) / denom
 
         xg = (xg - mean) / torch.sqrt(var + self.eps)
@@ -449,6 +449,9 @@ class LocalGlobalBranch(nn.Module):
 
 # ============================================================
 # Batched fold/unfold: unified 2D grid + mask (parallel over N=B*k)
+# P0优化点：
+#   1) 消灭 .item() 同步：不再取 tpad.max().item()
+#   2) 减少 scatter：改为“结构化网格 time->gather”，一次 gather 得到 Z 和 mask
 # ============================================================
 
 def fold_candidates_to_grid(
@@ -471,49 +474,47 @@ def fold_candidates_to_grid(
     dtype = s_flat.dtype
     N, _, C = s_flat.shape
 
-    p_flat = p_flat.clamp_min(1)
-    # per-candidate padded length to multiple of p: T_pad_i = ceil(T/p)*p
-    tpad = ((T + p_flat - 1) // p_flat) * p_flat  # [N]
-    tpad_max = int(tpad.max().item())
+    p_flat = p_flat.clamp_min(1).to(torch.long)
 
-    # time indices [0..tpad_max-1]
-    t_all = torch.arange(tpad_max, device=device, dtype=torch.long).view(1, -1).expand(N, -1)  # [N,tpad_max]
-    time_valid = t_all < tpad.view(N, 1)  # [N,tpad_max]
+    # per-candidate padded length to multiple of p: tpad_i = ceil(T/p)*p, stays on GPU (no .item())
+    tpad = ((T + p_flat - 1) // p_flat) * p_flat  # [N], long
 
-    # fetch source samples with reflect/constant padding
+    # structured grid coords
+    cyc = torch.arange(cyc_max, device=device, dtype=torch.long).view(1, cyc_max, 1)  # [1,H,1]
+    pos = torch.arange(p_max, device=device, dtype=torch.long).view(1, 1, p_max)      # [1,1,W]
+
+    # time index per candidate: time = cyc*p + pos  -> [N,H,W]
+    time = cyc * p_flat.view(N, 1, 1) + pos  # [N,H,W]
+
+    # valid mask in 2D (no scatter):
+    # 1) pos < p (within true period)
+    # 2) time < tpad (within padded length)
+    # 3) time can exceed T, but will be reflect-padded if reflect_pad=True
+    valid = (pos < p_flat.view(N, 1, 1)) & (time < tpad.view(N, 1, 1))  # [N,H,W]
+    mask2d = valid.to(dtype).unsqueeze(1)  # [N,1,H,W]
+
+    # gather source samples:
     if reflect_pad:
-        src_idx = _reflect_indices(t_all, T)  # [N,tpad_max]
-        s_src = s_flat.gather(1, src_idx.unsqueeze(-1).expand(N, tpad_max, C))  # [N,tpad_max,C]
+        src_idx = _reflect_indices(time, T)  # [N,H,W]
+        src = s_flat.gather(
+            1, src_idx.view(N, -1).unsqueeze(-1).expand(N, cyc_max * p_max, C)
+        )  # [N,H*W,C]
+        src = src.view(N, cyc_max, p_max, C)
     else:
-        src_idx = t_all.clamp_max(T - 1)
-        s_src = s_flat.gather(1, src_idx.unsqueeze(-1).expand(N, tpad_max, C))
-        s_src = s_src * (t_all < T).unsqueeze(-1).to(dtype)
+        src_idx = time.clamp_max(T - 1)
+        src = s_flat.gather(
+            1, src_idx.view(N, -1).unsqueeze(-1).expand(N, cyc_max * p_max, C)
+        ).view(N, cyc_max, p_max, C)
+        # zero out the beyond-T region (constant padding semantics)
+        src = src * (time < T).unsqueeze(-1).to(dtype)
 
-    s_src = s_src * time_valid.unsqueeze(-1).to(dtype)
+    # apply mask2d
+    src = src * valid.unsqueeze(-1).to(dtype)  # [N,H,W,C]
 
-    # 2D coords
-    cyc_idx = t_all // p_flat.view(N, 1)                    # [N,tpad_max]
-    pos_idx = t_all - cyc_idx * p_flat.view(N, 1)           # [N,tpad_max]
-    valid2d = time_valid & (pos_idx < p_flat.view(N, 1)) & (pos_idx < p_max) & (cyc_idx < cyc_max)
+    # to [N,C,H,W]
+    Z = src.permute(0, 3, 1, 2).contiguous()
 
-    HW = cyc_max * p_max
-    spatial = (cyc_idx * p_max + pos_idx).clamp(0, HW - 1)   # [N,tpad_max]
-
-    # scatter into grid
-    Z_flat = torch.zeros((N, C, HW), device=device, dtype=dtype)
-    idx_sp = spatial.unsqueeze(1).expand(N, C, tpad_max)     # [N,C,tpad_max]
-    src = s_src.permute(0, 2, 1)                             # [N,C,tpad_max]
-    src = src * valid2d.unsqueeze(1).to(dtype)
-    Z_flat.scatter_(2, idx_sp, src)
-    Z = Z_flat.view(N, C, cyc_max, p_max)
-
-    # build mask2d by scattering ones
-    M_flat = torch.zeros((N, 1, HW), device=device, dtype=dtype)
-    M_src = valid2d.to(dtype).unsqueeze(1)
-    M_flat.scatter_(2, spatial.unsqueeze(1), M_src)
-    mask2d = M_flat.view(N, 1, cyc_max, p_max)
-
-    # map for original T
+    # idx_map for unfold back to original T positions
     t_T = torch.arange(T, device=device, dtype=torch.long).view(1, -1).expand(N, -1)  # [N,T]
     cyc_T = (t_T // p_flat.view(N, 1)).clamp(0, cyc_max - 1)
     pos_T = (t_T - (t_T // p_flat.view(N, 1)) * p_flat.view(N, 1)).clamp(0, p_max - 1)
@@ -593,6 +594,8 @@ class DSDNetConfig:
 
 # ============================================================
 # DSDBlock (paper core): periodic trunk + periodic fusion module
+# P0优化点：
+#   3) period detection 可由 Model.forward 统一计算并复用，避免 e_layers 次 FFT+topk
 # ============================================================
 
 class DSDBlock(nn.Module):
@@ -640,8 +643,6 @@ class DSDBlock(nn.Module):
                 use_global_attn=cfg.use_global_attn
             )
 
-            # Paper: content-adaptive gate based on Hp/Hnp content, with Gamma prior
-            # We use pooled features: [mean(Hp), mean(Hnp), mean(Hnp-Hp)] => dim 3C
             hidden = max(16, cfg.d_model // 4)
             in_dim = cfg.d_model * 3
             self.gating_network = nn.Sequential(
@@ -655,22 +656,31 @@ class DSDBlock(nn.Module):
             nn.init.xavier_uniform_(self.gating_network[2].weight)
             nn.init.constant_(self.gating_network[2].bias, -2.0)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        x: torch.Tensor,
+        precomputed_period: Optional[Tuple[torch.Tensor, torch.Tensor]] = None
+    ) -> torch.Tensor:
         """
         x: [B,T,C]
+        precomputed_period: Optional (idx, w_prior) where
+            idx: [B,k], w_prior: [B,k]
         """
         B, T, C = x.shape
         assert C == self.d_model
 
         # ---- decompose ----
         if self.use_series_decomp and self.decomp is not None:
-            s, t = self.decomp(x)  # [B,T,C]
+            s, _t = self.decomp(x)  # [B,T,C]
         else:
-            s, t = x, torch.zeros_like(x)
+            s = x
 
         # ---- periods & w_prior ----
         max_p = self.cfg.max_period if self.cfg.max_period is not None else (T // 2)
-        idx, w_prior = auto_correlation_topk(s, self.k, min_p=self.min_p, max_p=max_p)  # [B,k], [B,k]
+        if precomputed_period is None:
+            idx, w_prior = auto_correlation_topk(s, self.k, min_p=self.min_p, max_p=max_p)  # [B,k], [B,k]
+        else:
+            idx, w_prior = precomputed_period
 
         # ---- expand candidates: N=B*k ----
         N = B * self.k
@@ -682,13 +692,13 @@ class DSDBlock(nn.Module):
         p_max = int(max_p)
         cyc_max = int((T + self.min_p - 1) // self.min_p)  # ceil(T/min_p)
 
-        # ---- fold all candidates in parallel ----
+        # ---- fold all candidates in parallel (no scatter, no .item()) ----
         Z, mask2d, idx_map = fold_candidates_to_grid(
             s_flat, p_flat=p_flat, T=T, p_max=p_max, cyc_max=cyc_max, reflect_pad=self.cfg.reflect_pad
         )
-        Z = Z * mask2d
 
         # ---- periodic trunk ----
+        Z = Z * mask2d
         Z = self.block2d(Z, mask2d=mask2d)
         if self.cyc1d is not None:
             Z = self.cyc1d(Z, mask2d=mask2d)
@@ -717,7 +727,7 @@ class DSDBlock(nn.Module):
         agg = agg_num / agg_den                          # [B,T,C]
 
         # ---- periodic output ----
-        Hp = agg + x  # paper-consistent seasonal replacement + trend passthrough collapses to agg + x
+        Hp = agg + x
         periodic_res = Hp - x
 
         # ---- if no dual path ----
@@ -726,15 +736,11 @@ class DSDBlock(nn.Module):
 
         # ---- non-periodic branch ----
         Hnp = self.local_branch(x)    # [B,T,C]
-
-        # Paper: inject non-periodic info as residual on Hp
         res_np = Hnp - Hp             # [B,T,C]
 
-        # optional orthogonalization (keep complement)
         if self.cfg.use_orthogonal:
             res_np = _orth_residual(res_np, periodic_res.detach())
 
-        # Gamma periodic confidence
         with torch.no_grad():
             Gamma = _period_confidence_from_wprior(w_prior)  # [B] in [0,1]
 
@@ -744,18 +750,15 @@ class DSDBlock(nn.Module):
             gate = torch.ones((B, 1, C), device=x.device, dtype=x.dtype)
 
         elif mode == "adaptive":
-            # gate = sigmoid( -alpha*(Gamma - tau) ), broadcast to channels
             g_prior = -self.cfg.gate_alpha * (Gamma - self.cfg.gate_tau)  # [B]
             gate = torch.sigmoid(g_prior).view(B, 1, 1).expand(B, 1, C)
 
         else:
-            # learnable: content-adaptive gate with Gamma prior constraint
             Hp_g = Hp.mean(dim=1)         # [B,C]
             Hnp_g = Hnp.mean(dim=1)       # [B,C]
             res_g = res_np.mean(dim=1)    # [B,C]
             gate_in = torch.cat([Hp_g, Hnp_g, res_g], dim=-1)  # [B,3C]
             g_logit = self.gating_network(gate_in)             # [B,C]
-            # Gamma prior: periodic stronger => close gate
             g_logit = g_logit - self.cfg.gate_alpha * (Gamma - self.cfg.gate_tau).unsqueeze(-1)
             gate = torch.sigmoid(g_logit).unsqueeze(1)         # [B,1,C]
 
@@ -766,6 +769,8 @@ class DSDBlock(nn.Module):
 # ============================================================
 # DSD-Net model: project -> blocks -> pooling -> classifier
 # Exposes class Model (TimesNet codebase requirement)
+# P0优化点：
+#   3) period detection 在 Model.forward 统一计算一次，并传入所有 block 复用
 # ============================================================
 
 class Model(nn.Module):
@@ -776,7 +781,6 @@ class Model(nn.Module):
     def __init__(self, args):
         super().__init__()
 
-        # ---- build cfg from args (Namespace) ----
         cfg = DSDNetConfig(
             enc_in=int(getattr(args, "enc_in")),
             num_class=int(getattr(args, "num_class", getattr(args, "c_out", 2))),
@@ -822,19 +826,22 @@ class Model(nn.Module):
         self.blocks = nn.ModuleList([DSDBlock(cfg) for _ in range(cfg.e_layers)])
         self.norms = nn.ModuleList([nn.LayerNorm(cfg.d_model) for _ in range(cfg.e_layers)])
 
-        # control series decomp ablation at block-level (keeps structure but disables module)
-        use_series_decomp = bool(int(getattr(args, "use_series_decomp", 1)))
+        # ---- series decomp ablation (block-level) ----
+        self.use_series_decomp = bool(int(getattr(args, "use_series_decomp", 1)))
         for b in self.blocks:
-            b.use_series_decomp = use_series_decomp
-            if not use_series_decomp:
+            b.use_series_decomp = self.use_series_decomp
+            if not self.use_series_decomp:
                 b.decomp = None
+
+        # ---- Model-level decomp for period reuse ----
+        # 注意：这是“代码级复用”的关键：只算一次 idx/w_prior，供所有 block 共享
+        self._period_decomp = SeriesDecomp(cfg.moving_avg) if self.use_series_decomp else None
 
         # ---- pooling head ----
         self.pool_q = nn.Parameter(torch.randn(1, 1, cfg.d_model))
         self.dropout = nn.Dropout(cfg.dropout)
         self.classifier = nn.Linear(cfg.d_model, cfg.num_class)
 
-        # optional temperature (kept for compatibility)
         self.logit_T = nn.Parameter(torch.tensor(1.0, dtype=torch.float32))
 
     def attention_pool(self, x: torch.Tensor) -> torch.Tensor:
@@ -845,6 +852,22 @@ class Model(nn.Module):
         att = torch.softmax(att, dim=-1)
         return (att @ x).squeeze(1)
 
+    def _compute_period_once(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        x: [B,T,C] after projection
+        returns idx:[B,k], w_prior:[B,k]
+        """
+        B, T, C = x.shape
+        max_p = self.cfg.max_period if self.cfg.max_period is not None else (T // 2)
+
+        if self._period_decomp is not None:
+            s, _t = self._period_decomp(x)
+        else:
+            s = x
+
+        idx, w_prior = auto_correlation_topk(s, self.cfg.top_k, min_p=self.cfg.min_period, max_p=max_p)
+        return idx, w_prior
+
     def forward(self, x_enc: torch.Tensor, *args, **kwargs) -> torch.Tensor:
         """
         Classification:
@@ -852,8 +875,12 @@ class Model(nn.Module):
         TimesNet codebase may pass extra marks; we ignore them safely.
         """
         x = self.project(x_enc)  # [B,T,d]
+
+        # P0：period detection 统一计算一次并复用（避免每层 FFT+topk）
+        pre_period = self._compute_period_once(x)
+
         for blk, ln in zip(self.blocks, self.norms):
-            x = ln(blk(x))
+            x = ln(blk(x, precomputed_period=pre_period))
 
         x = self.attention_pool(x)  # [B,d]
         x = self.dropout(x)
