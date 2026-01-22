@@ -805,7 +805,7 @@ class Model(nn.Module):
 
             use_gate_mlp=bool(int(getattr(args, "use_gate_mlp", 1))),
 
-            use_dual_path=bool(int(getattr(args, "use_dual_path", 0))),
+            use_dual_path=bool(int(getattr(args, "use_dual_path", 1))),
             local_kernel=int(getattr(args, "local_kernel", 7)),
             use_global_attn=bool(int(getattr(args, "use_global_attn", 0))),
 
